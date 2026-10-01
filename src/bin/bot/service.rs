@@ -697,8 +697,13 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             s.paper_realized = m.end_equity - m.start_equity;
             s.paper_open = m.open_unrealized;
             s.paper_max_drawdown_pct = m.max_drawdown_pct;
-            s.effective_pairs = ps.portfolio.effective_top;
-            s.allocation_note = ps.portfolio.allocation_note.clone();
+            if ps.portfolio.entries_allowed {
+                s.effective_pairs = ps.portfolio.effective_top;
+                s.allocation_note = ps.portfolio.allocation_note.clone();
+            } else {
+                s.effective_pairs = 0;
+                s.allocation_note = "no entries: the walk-forward gate is closed".into();
+            }
         }
         s.mode = if report.passed {
             "PASSED"

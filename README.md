@@ -6,7 +6,7 @@ A Rust paper-trading and research service for Bybit USDT perpetuals. It reads re
 
 ## Strategy
 
-- **Universe:** the top 50 token USDT perpetuals on Bybit by 24-hour turnover; stock, ETF, forex and commodity contracts, delistings and pre-listings are excluded.
+- **Universe:** the top 50 token USDT perpetuals on Bybit by 24-hour turnover **that have complete Bybit rules** (margin tiers, account fee, lot filter, measured order book). The top 75 are measured hourly; a coin missing any of that is dropped and the next one by turnover takes its place. Stock, ETF, forex and commodity contracts, delistings and pre-listings are excluded.
 - **Signal (live family):** contrarian Pulse. Long the most bearish, short the most bullish, equal notional per leg, market-neutral within 2%.
 - **Settings:** chosen every bar by a 14-day walk-forward from 48 combinations: either direction, 5 or 10 pairs, 4/8/24-hour rebalances, 1× or 2× leverage, no stop or a 20% stop.
 - **Balance-aware sizing:** pairs are funded from the free balance, i.e. the wallet minus margin committed anywhere on the account (other positions, orders, locks). Smaller balances use fewer pairs; a contract whose lot step would unbalance the basket is left out at that size. Below **5 USDT free, nothing is opened or added**; exits continue.

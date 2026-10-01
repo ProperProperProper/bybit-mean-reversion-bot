@@ -9,8 +9,8 @@ The original three tools are read-only towards Bybit. They need the Keychain cre
 Builds the research data:
 
 1. Prints the real account balance.
-2. Lists today's top 50 token USDT perpetuals by 24h turnover (never delisted ones) and stores their launch times and the universe.
-3. Measures their Bybit rules now (fails rather than storing an incomplete snapshot).
+2. Lists today's top 75 token USDT perpetuals by 24h turnover (never delisted ones).
+3. Measures their Bybit rules now (fails rather than storing an incomplete snapshot) and keeps the top 50 with complete rules as the universe, storing their launch times.
 4. For each of the three 14-day windows ([research.md](research.md)), fetches any missing traded and mark candles and the settled funding into `window_k.db` (6 coins at a time, paced), recording a new listing's first trade.
 
 Any symbol still missing a candle after its listing start fails the run.

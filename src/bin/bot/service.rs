@@ -428,21 +428,22 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             continue;
         }
         let t0 = Instant::now();
-        // Symbols (trading, no delisting scheduled) and, hourly, their full Bybit
-        // rules: order rules, the account's fees, margin tiers, measured books.
+        // Candidates by turnover (trading, no delisting scheduled) and, hourly,
+        // their full Bybit rules: order rules, the account's fees, margin tiers,
+        // measured books. The universe is the top 50 with complete rules.
         let lots = app.client.usdt_perpetual_lots().await?;
-        let lots = app
+        let candidates = app
             .client
-            .top_margin_tokens(&lots, walkforward::UNIVERSE)
+            .top_margin_tokens(&lots, walkforward::CANDIDATES)
             .await?;
-        app.cache.put_instruments(&lots)?;
+        app.cache.put_instruments(&candidates)?;
         let stale = app
             .rules_at
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_none_or(|t| t.elapsed() >= RULES_REFRESH);
         if stale {
-            let rules = app.client.fetch_rules(&app.creds, &lots).await?;
+            let rules = app.client.fetch_rules(&app.creds, &candidates).await?;
             app.cache.put_rules(&rules)?;
 
             *app.rules_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -455,6 +456,21 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // mirrored; margin committed elsewhere on the account is reserved).
         let account = app.client.usdt_account(&app.creds).await?;
         let balance = account.wallet;
+        let lots = data::universe(
+            &candidates,
+            &app.cache.rules_symbols()?,
+            walkforward::UNIVERSE,
+        );
+        if lots.len() < walkforward::UNIVERSE {
+            app.event(
+                "WARN",
+                format!(
+                    "only {} of the top {} coins have complete Bybit rules",
+                    lots.len(),
+                    walkforward::CANDIDATES
+                ),
+            );
+        }
         let mut symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
         app.cache.put_universe(&symbols)?;
         // Keep managing previously held symbols even if turnover leaves the top 50.

@@ -33,12 +33,13 @@ async fn backtest() -> Result<()> {
     // Size from the free balance, as the service does.
     let balance = account.wallet - account.reserved();
     let lots = client.usdt_perpetual_lots().await?;
-    let lots = client
-        .top_margin_tokens(&lots, walkforward::UNIVERSE)
+    let candidates = client
+        .top_margin_tokens(&lots, walkforward::CANDIDATES)
         .await?;
-    cache.put_instruments(&lots)?;
+    cache.put_instruments(&candidates)?;
     eprintln!("real account free balance {balance:.2} USDT; measuring Bybit rules (fees, margin tiers, order books)...");
-    cache.put_rules(&client.fetch_rules(&creds, &lots).await?)?;
+    cache.put_rules(&client.fetch_rules(&creds, &candidates).await?)?;
+    let lots = data::universe(&candidates, &cache.rules_symbols()?, walkforward::UNIVERSE);
     let symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
     cache.put_universe(&symbols)?;
     eprintln!(

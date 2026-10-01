@@ -39,7 +39,7 @@ The console chart: settings chosen by the live walk-forward on research window 2
 
 ### `bar_task`: once per closed 15-minute bar
 
-1. Lists the top 50 token USDT perpetuals by 24h turnover and stores their launch times; hourly, re-measures their rules.
+1. Lists the top 75 token USDT perpetuals by 24h turnover and stores their launch times; hourly, re-measures their rules. The universe is the top 50 of them with complete rules (a warning is logged if fewer qualify).
 2. Reads the real account: wallet and committed margin.
 3. Syncs traded and mark candles and funding for the universe plus any held symbol.
 4. Builds the 14-day market. **A symbol with incomplete real data sits out this bar** (logged); a held symbol must be complete or the bar fails.

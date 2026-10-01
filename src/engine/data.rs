@@ -568,6 +568,22 @@ fn with_deductions(mut tiers: Vec<(MarginTier, Option<f64>)>) -> Option<Vec<Marg
     Some(out)
 }
 
+/// The first `n` of `candidates` (ranked by turnover) that have complete Bybit
+/// rules: coins without margin tiers, fee, lot filter or a measurable book are
+/// left out and the next coin by turnover takes the place.
+pub fn universe(
+    candidates: &[(String, Option<LotFilter>, i64)],
+    measured: &std::collections::HashSet<String>,
+    n: usize,
+) -> Vec<(String, Option<LotFilter>, i64)> {
+    candidates
+        .iter()
+        .filter(|(s, _, _)| measured.contains(s))
+        .take(n)
+        .cloned()
+        .collect()
+}
+
 /// The real account's USDT wallet balance and how much of it is committed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AccountBalance {
@@ -806,6 +822,15 @@ impl Cache {
         })
     }
 
+    /// Symbols with stored Bybit rules.
+    pub fn rules_symbols(&self) -> Result<std::collections::HashSet<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT symbol FROM rules")?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
     /// (symbols, last bar ts) present in the cache.
     pub fn contents(&self) -> Result<(Vec<String>, i64)> {
         self.with(|c| {
@@ -1034,6 +1059,24 @@ mod gap_tests {
     }
 
     #[test]
+    fn universe_skips_coins_without_rules() {
+        let cache = Cache::open(":memory:").unwrap();
+        let r = crate::engine::rules::Rules::test_liquid();
+        cache
+            .put_rules(&[("BTCUSDT".into(), r.clone()), ("SOLUSDT".into(), r)])
+            .unwrap();
+        let ranked: Vec<(String, Option<LotFilter>, i64)> = ["BTCUSDT", "VVVUSDT", "SOLUSDT"]
+            .iter()
+            .map(|s| (s.to_string(), None, 1))
+            .collect();
+        let picked: Vec<String> = universe(&ranked, &cache.rules_symbols().unwrap(), 2)
+            .into_iter()
+            .map(|x| x.0)
+            .collect();
+        assert_eq!(picked, ["BTCUSDT", "SOLUSDT"]);
+    }
+
+    #[test]
     fn account_balance_reserves_committed_margin() {
         let a = parse_account(&serde_json::json!({"coin":"USDT","walletBalance":"100",
             "totalPositionIM":"30.5","totalOrderIM":"2","locked":"0.5"}))
@@ -1091,6 +1134,10 @@ mod gap_tests {
             .unwrap();
         assert_eq!(cache.bars_since("NEW", 0, 4 * BAR_MS).unwrap(), 3 * BAR_MS);
         let m = cache.market(&["NEW".into()], 4 * BAR_MS).unwrap();
-        assert_eq!(m.listing_times, vec![Some(3 * BAR_MS)], "launch rounded up to its first bar");
+        assert_eq!(
+            m.listing_times,
+            vec![Some(3 * BAR_MS)],
+            "launch rounded up to its first bar"
+        );
     }
 }

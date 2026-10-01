@@ -5,8 +5,9 @@
 //! the runtime folder (`engine::runtime_dir`) as the three research windows
 //! (`engine::research`: Aug 20 -> Sep 3 -> Sep 17 -> Oct 1 2026, 08:30 UTC).
 //! Only fetches symbols a window does not have yet. Read-only towards Bybit.
-use bybit_mean_reversion_bot::engine::data::{Cache, Client};
+use bybit_mean_reversion_bot::engine::data::{self, Cache, Client};
 use bybit_mean_reversion_bot::engine::keychain;
+use bybit_mean_reversion_bot::engine::walkforward;
 use bybit_mean_reversion_bot::engine::{research, BAR_MS};
 use futures_util::{stream, StreamExt};
 
@@ -20,16 +21,20 @@ async fn main() -> anyhow::Result<()> {
         client.usdt_account(&creds).await?.wallet
     );
     let lots = client.usdt_perpetual_lots().await?;
-    let lots = client
-        .top_margin_tokens(
-            &lots,
-            bybit_mean_reversion_bot::engine::walkforward::UNIVERSE,
-        )
+    let candidates = client
+        .top_margin_tokens(&lots, walkforward::CANDIDATES)
         .await?;
+    eprintln!("measuring {} order books...", candidates.len());
+    let rules = client.fetch_rules(&creds, &candidates).await?;
+    let measured = rules.iter().map(|(s, _)| s.clone()).collect();
+    let lots = data::universe(&candidates, &measured, walkforward::UNIVERSE);
     let symbols: Vec<String> = lots.iter().map(|(s, _, _)| s.clone()).collect();
-    eprintln!("measuring {} order books...", symbols.len());
-    let rules = client.fetch_rules(&creds, &lots).await?;
-    println!("rules for {} of {} symbols", rules.len(), symbols.len());
+    println!(
+        "rules for {} of {} candidates; universe {} coins",
+        rules.len(),
+        candidates.len(),
+        symbols.len()
+    );
     for k in 1..=3 {
         let (first, last) = research::window_bounds(k);
         let cache = Cache::open(research::window_file(&dir, k).to_str().unwrap_or_default())?;

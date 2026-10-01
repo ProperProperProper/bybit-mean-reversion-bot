@@ -24,7 +24,7 @@ pub const IS_BARS: usize = 768;
 pub const OOS_BARS: usize = 192;
 pub const WINDOW_STARTS: [usize; 3] = [0, 192, 384];
 /// Top 100 Bybit USDT perpetuals by rolling 24h turnover at each bar (all leverage-capable).
-pub const UNIVERSE: usize = 100;
+pub const UNIVERSE: usize = 50;
 pub const MIN_IS_TRADES: usize = 8;
 pub const MIN_OOS_TRADES: usize = 8;
 pub const MAX_DRAWDOWN_PCT: f64 = 25.0;
@@ -116,21 +116,12 @@ mod tests {
 
 use super::xs::{self, Signal, XsParams};
 
-/// The family the live paper service trades. Chosen by examples/research.rs on
-/// three independent 14-day windows of real data (2026-08-20..10-01) with real
-/// Bybit rules (account fee, margin tiers, measured order books) from the real
-/// account balance (109.48 USDT): contrarian Pulse was the only signal positive
-/// out-of-sample in all three walk-forwards (+12.6/+12.9/+4.5%, PF 1.23/1.19/
-/// 1.16; in two the profit rests on one 2-day window) AND in both 14-day forward
-/// tests (+40.6%/+28.3%, +25.5%/+23.3% at 2x costs, 0 liquidations, max drawdown
-/// 28.0%/21.3%). Thin, lumpy edge; picked from 7 families.
+/// The current paper strategy family. Historical selection results must be
+/// rerun after accounting/data fixes; this constant is not a profitability claim.
 pub const LIVE_SIGNAL: Signal = Signal::Pulse;
 
-/// The live grid: the signal family, no drawdown rule. examples/risk_variants.rs
-/// tested nine rules with real Bybit rules from the real account balance: only
-/// "no rule" was positive in all five checks, also at 2x costs (adding once at
-/// 10% against, fully funded, halves drawdown to ~14% but lost at 2x costs in
-/// one forward test; stops and take-profits lost money).
+/// Current paper grid without an optional drawdown rule. Use the research
+/// examples to compare alternatives on corrected accounting and untouched data.
 pub fn live_grid() -> Vec<XsParams> {
     xs_family_grid(LIVE_SIGNAL)
 }
@@ -226,14 +217,17 @@ impl<P> WfReport<P> {
     /// window found params, final params survive the 14 days, but the profit
     /// factor gate may be missed. Paper keeps forward-testing in this state.
     pub fn forward_ok(&self) -> bool {
-        self.windows.iter().all(|w| w.params.is_some())
+        self.oos.execution_error.is_none()
+            && self.windows.iter().all(|w| w.params.is_some())
             && self.oos.trades >= MIN_OOS_TRADES
             && self.oos.liquidations == 0
             && self.oos.net() > 0.0
-            && self
-                .full_period
-                .as_ref()
-                .is_some_and(|f| f.liquidations == 0 && f.max_drawdown_pct <= MAX_DRAWDOWN_PCT)
+            && self.full_period.as_ref().is_some_and(|f| {
+                f.execution_error.is_none()
+                    && f.net() > 0.0
+                    && f.liquidations == 0
+                    && f.max_drawdown_pct <= MAX_DRAWDOWN_PCT
+            })
     }
 }
 
@@ -252,11 +246,14 @@ fn wf_best<P: Clone>(
         gov.checkpoint(deadline)?;
         *evaluated += 1;
         let r = bt(p, range.clone());
-        if r.liquidations > 0 || r.trades < MIN_IS_TRADES {
+        if r.execution_error.is_some() || r.liquidations > 0 || r.trades < MIN_IS_TRADES {
             continue;
         }
         let survival = bt(p, 0..range.end);
-        if survival.liquidations > 0 || survival.max_drawdown_pct > MAX_DRAWDOWN_PCT {
+        if survival.execution_error.is_some()
+            || survival.liquidations > 0
+            || survival.max_drawdown_pct > MAX_DRAWDOWN_PCT
+        {
             continue;
         }
         let score = objective(&r);
@@ -297,6 +294,10 @@ pub fn run_wf<P: Clone>(
         let (params, is_m, oos_m) = match best {
             Some((p, is_m)) => {
                 let o = bt(&p, oos_r.clone());
+                if o.execution_error.is_some() {
+                    oos.execution_error = o.execution_error.clone();
+                }
+                oos.rejected_rebalances += o.rejected_rebalances;
                 oos.trades += o.trades;
                 oos.wins += o.wins;
                 oos.gross_profit += o.gross_profit;
@@ -326,6 +327,9 @@ pub fn run_wf<P: Clone>(
     let best = nets.iter().cloned().fold(0.0, f64::max);
     let net_without_best = nets.iter().sum::<f64>() - best;
     let mut reasons = Vec::new();
+    if let Some(e) = &oos.execution_error {
+        reasons.push(format!("invalid out-of-sample execution: {e}"));
+    }
     if windows.iter().any(|w| w.params.is_none()) {
         reasons.push("a window had no params that traded enough without liquidating".into());
     }
@@ -351,6 +355,9 @@ pub fn run_wf<P: Clone>(
         reasons.push(format!("out-of-sample net {:.2} (need > 0)", oos.net()));
     }
     match &full {
+        Some(f) if f.execution_error.is_some() => {
+            reasons.push(format!("invalid final execution: {:?}", f.execution_error))
+        }
         None => reasons.push("no params qualified on the most recent 8 days".into()),
         Some(f) if f.liquidations > 0 => {
             reasons.push("final params liquidate within the 14 days".into())
@@ -388,6 +395,7 @@ pub fn run_xs_with(
     deadline: Instant,
     grid: &[XsParams],
 ) -> Result<XsReport> {
+    m.validate()?;
     run_wf(&m.ts, grid, equity, deadline, |p, r| {
         xs::backtest(m, scores, r, p, equity).metrics()
     })

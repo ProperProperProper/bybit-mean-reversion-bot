@@ -2,18 +2,19 @@
 //! walkforward::LIVE_SIGNAL for the evidence) — never places orders.
 //!
 //! bar_task (each 15m close): sync closed bars + funding for every USDT
-//! perpetual -> scores (top-100 universe by 24h turnover) -> 14-day
+//! perpetual -> scores (top-50 universe by 24h turnover) -> 14-day
 //! walk-forward -> step the persisted paper portfolio through every new bar
 //! with the chosen params (missed bars replayed in order) -> publish the
 //! current LONG (most bearish Pulse) / SHORT (most bullish Pulse) targets.
-//! Console: 127.0.0.1:8787 (`/`, `/api/status`, `/api/signals`), polling only.
+//! Console: 127.0.0.1:8787 (`/`, `/api/status`, `/api/signals`, `/api/research`),
+//! polled by the page (no WebSocket).
 
 use anyhow::Result;
 use bybit_mean_reversion_bot::engine::scores;
 use bybit_mean_reversion_bot::engine::supervisor::{Health, Heartbeat};
 use bybit_mean_reversion_bot::engine::walkforward::{self, XsReport};
 use bybit_mean_reversion_bot::engine::xs::{self, XsParams, XsPortfolio};
-use bybit_mean_reversion_bot::engine::{data, governor, keychain, Side, BARS, BAR_MS};
+use bybit_mean_reversion_bot::engine::{data, governor, keychain, research, Side, BARS, BAR_MS};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -69,8 +70,12 @@ pub struct Status {
     /// Mark-to-market of open positions at the last close (before exit fees).
     pub paper_open: f64,
     pub paper_max_drawdown_pct: f64,
+    pub effective_pairs: usize,
+    pub allocation_note: String,
     /// The real Bybit account's USDT wallet balance (read every bar, read-only).
     pub account_balance: f64,
+    /// Part of it committed to other positions, orders and locks (never used here).
+    pub account_reserved: f64,
     pub account_balance_ts: i64,
     /// Symbols with complete Bybit rules, and when they were last measured.
     pub rules_symbols: usize,
@@ -78,8 +83,12 @@ pub struct Status {
     pub events: VecDeque<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PaperState {
+    #[serde(default = "legacy_version")]
+    schema_version: u32,
+    #[serde(default)]
+    settlements_seen: std::collections::BTreeMap<String, f64>,
     portfolio: XsPortfolio,
     last_ts: i64,
     /// Params last used, so open positions stay managed (stops, rebalances)
@@ -89,6 +98,154 @@ struct PaperState {
     /// Real account balance last mirrored; a change is a deposit or withdrawal.
     #[serde(default)]
     last_account_balance: Option<f64>,
+}
+
+fn legacy_version() -> u32 {
+    1
+}
+
+fn load_paper(path: &Path) -> Result<Option<PaperState>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut state: PaperState = serde_json::from_str(&text)?;
+    anyhow::ensure!(
+        state.schema_version <= 2,
+        "unsupported paper schema {}",
+        state.schema_version
+    );
+    if state.schema_version < 2 {
+        anyhow::ensure!(
+            state.portfolio.positions.is_empty() && state.portfolio.trades.is_empty(),
+            "legacy paper history needs replay migration; refusing to reset it"
+        );
+        state.schema_version = 2;
+    }
+    state.portfolio.validate_state()?;
+    anyhow::ensure!(
+        state.last_ts >= 0 && state.last_ts % BAR_MS == 0,
+        "invalid paper checkpoint"
+    );
+    Ok(Some(state))
+}
+
+fn persist_paper(path: &Path, state: &PaperState) -> Result<()> {
+    state.portfolio.validate_state()?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    serde_json::to_writer(&mut file, state)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Replay only contiguous unseen bars with the previously known settings.
+/// Later balance observations and reports must not resize historical orders.
+fn advance_paper(
+    ps: &mut PaperState,
+    market: &bybit_mean_reversion_bot::engine::Market,
+    sc: &[Vec<Option<scores::Score>>],
+    next: &XsParams,
+    allowed: bool,
+    ready_ts: i64,
+    observed: Option<data::AccountBalance>,
+) -> Result<()> {
+    anyhow::ensure!(!market.ts.is_empty(), "empty paper market");
+    anyhow::ensure!(
+        market.ts.windows(2).all(|w| w[1] - w[0] == BAR_MS),
+        "noncontiguous paper timeline"
+    );
+    let mut candidate = ps.clone();
+    if let Some(previous) = candidate.params.clone() {
+        if let Some(&first) = market.ts.iter().find(|&&ts| ts > candidate.last_ts) {
+            anyhow::ensure!(first==candidate.last_ts+BAR_MS,"paper checkpoint {} predates available history starting at {first}; recovery replay required",candidate.last_ts);
+        }
+        for (sym, name) in market.symbols.iter().enumerate() {
+            for &(ts, rate) in &market.funding[sym] {
+                if ts > candidate.last_ts {
+                    continue;
+                }
+                let owned = candidate
+                    .portfolio
+                    .positions
+                    .iter()
+                    .any(|p| p.symbol == *name && p.entry_ts < ts)
+                    || candidate
+                        .portfolio
+                        .trades
+                        .iter()
+                        .any(|p| p.symbol == *name && p.entry_ts < ts && p.exit_ts >= ts);
+                if owned {
+                    let key = format!("{name}:{ts}");
+                    anyhow::ensure!(
+                        candidate.settlements_seen.get(&key) == Some(&rate),
+                        "late/revised funding {key}: replay recovery required"
+                    );
+                }
+            }
+        }
+        for t in 0..market.ts.len() {
+            if market.ts[t] > candidate.last_ts {
+                let ts = market.ts[t];
+                for pos in &candidate.portfolio.positions {
+                    for &(f, rate) in &market.funding[pos.sym] {
+                        if f == ts {
+                            candidate
+                                .settlements_seen
+                                .insert(format!("{}:{f}", pos.symbol), rate);
+                        }
+                    }
+                }
+                candidate.portfolio.step(market, sc, t, &previous);
+                candidate.portfolio.validate_state()?;
+                for pos in &candidate.portfolio.positions {
+                    if let Some(f) = pos.last_funding_ts {
+                        if f == ts + BAR_MS {
+                            if let Some(&(_, rate)) =
+                                market.funding[pos.sym].iter().find(|(time, _)| *time == f)
+                            {
+                                candidate
+                                    .settlements_seen
+                                    .insert(format!("{}:{f}", pos.symbol), rate);
+                            }
+                        }
+                    }
+                }
+                candidate.last_ts = ts;
+            }
+        }
+    }
+    if let Some(account) = observed {
+        let balance = account.wallet;
+        anyhow::ensure!(
+            balance.is_finite() && balance >= 0.0,
+            "invalid balance observation"
+        );
+        // Margin the real account has committed elsewhere is never free here.
+        candidate.portfolio.reserved = account.reserved();
+        if let Some(previous) = candidate.last_account_balance {
+            let delta = balance - previous;
+            if delta != 0.0 {
+                candidate.portfolio.cash_flow(delta);
+            }
+        }
+        candidate.last_account_balance = Some(balance);
+    }
+    let t = market.ts.len() - 1;
+    candidate.last_ts = market.ts[t];
+    if candidate.params.as_ref() != Some(next) || candidate.portfolio.entries_allowed != allowed {
+        candidate.portfolio.install_entry_gate(allowed);
+    }
+    candidate.params = Some(next.clone());
+    candidate.portfolio.decide_close(market, sc, t, next);
+    candidate.portfolio.defer_new_decisions(ready_ts);
+    *ps = candidate;
+    Ok(())
 }
 
 struct App {
@@ -121,18 +278,12 @@ impl App {
         s.events.truncate(120);
     }
 
-    fn save_paper(&self) {
+    fn save_paper(&self) -> Result<()> {
         let guard = self.paper.read().unwrap_or_else(|p| p.into_inner());
         if let Some(ps) = guard.as_ref() {
-            let tmp = self.dir.join(format!("{PAPER_FILE}.tmp"));
-            let ok = serde_json::to_string(ps)
-                .map_err(std::io::Error::other)
-                .and_then(|s| std::fs::write(&tmp, s))
-                .and_then(|_| std::fs::rename(&tmp, self.dir.join(PAPER_FILE)));
-            if let Err(e) = ok {
-                error!("could not persist paper state: {e}");
-            }
+            persist_paper(&self.dir.join(PAPER_FILE), ps)?;
         }
+        Ok(())
     }
 }
 
@@ -140,9 +291,7 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
     info!("Bybit Mean Reversion Bot — contrarian Pulse, market-neutral (paper + signals only): 15m bars, top {} USDT perps, 14-day walk-forward, CPU target {}%",
         walkforward::UNIVERSE, governor::CPU_TARGET_PCT);
     governor::global();
-    let paper: Option<PaperState> = std::fs::read_to_string(dir.join(PAPER_FILE))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
+    let paper = load_paper(&dir.join(PAPER_FILE))?;
     let health = Health::default();
     // Read-only credentials for the account balance and fee rates; no guessing
     // without them (the service stops and launchd retries).
@@ -209,7 +358,7 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
-    app.save_paper();
+    app.save_paper()?;
     info!("shutdown");
     Ok(())
 }
@@ -219,19 +368,12 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
 /// trade the next 14 days, Sep 17 -> Oct 1, which they never saw, from
 /// the real account balance. The earlier window only supplies the screener's look-back
 /// at the start, as the live bot has it. Real cached Bybit bars + funding only
-/// (runtime window_2.db, window_3.db); errors if missing.
+/// (research windows 2 and 3, `engine::research`); errors if missing.
 fn forward_test_daily(dir: &Path, start: f64) -> Result<serde_json::Value> {
-    const RESEARCH_FIRST_BAR: i64 = 1_789_633_800_000;
-    let span = BARS as i64 * BAR_MS;
-    let w3_last = RESEARCH_FIRST_BAR + span - BAR_MS;
-    let mut markets = Vec::new();
-    for (file, last) in [("window_2.db", w3_last - span), ("window_3.db", w3_last)] {
-        let path = dir.join(file);
-        anyhow::ensure!(path.exists(), "research cache {file} not found");
-        let cache = data::Cache::open(path.to_str().unwrap_or(file))?;
-        let (symbols, _) = cache.contents()?;
-        markets.push(cache.market(&symbols, last)?);
-    }
+    let markets = [
+        research::load_window(dir, 2)?,
+        research::load_window(dir, 3)?,
+    ];
     // Settings are chosen on the first 14-day window alone (exactly as live); the
     // next 14 days are traded on the joined timeline so the screener keeps its
     // look-back at the start (live it always has it): no artificial warm-up gap.
@@ -284,6 +426,11 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // Symbols (trading, no delisting scheduled) and, hourly, their full Bybit
         // rules: order rules, the account's fees, margin tiers, measured books.
         let lots = app.client.usdt_perpetual_lots().await?;
+        let lots = app
+            .client
+            .top_margin_tokens(&lots, walkforward::UNIVERSE)
+            .await?;
+        app.cache.put_instruments(&lots)?;
         let stale = app
             .rules_at
             .lock()
@@ -292,15 +439,28 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         if stale {
             let rules = app.client.fetch_rules(&app.creds, &lots).await?;
             app.cache.put_rules(&rules)?;
+
             *app.rules_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             let mut s = app.status.write().unwrap_or_else(|e| e.into_inner());
             s.rules_symbols = rules.len();
             s.rules_ts = chrono::Utc::now().timestamp_millis();
         }
         hb.beat();
-        // The real account balance, every bar (deposits and withdrawals are mirrored).
-        let balance = app.client.usdt_wallet_balance(&app.creds).await?;
-        let symbols: Vec<String> = lots.into_iter().map(|(s, _)| s).collect();
+        // The real account balance, every bar (deposits and withdrawals are
+        // mirrored; margin committed elsewhere on the account is reserved).
+        let account = app.client.usdt_account(&app.creds).await?;
+        let balance = account.wallet;
+        let mut symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
+        app.cache.put_universe(&symbols)?;
+        // Keep managing previously held symbols even if turnover leaves the top 50.
+        if let Some(ps) = app.paper.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            for pos in &ps.portfolio.positions {
+                if !symbols.contains(&pos.symbol) {
+                    symbols.push(pos.symbol.clone());
+                }
+            }
+        }
+        symbols.sort();
         let hb2 = hb.clone();
         let last = data::sync(&app.client, &app.cache, &symbols, move |_, _| hb2.beat()).await?;
         if last < closed {
@@ -308,18 +468,57 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             continue;
         }
         let sync_secs = t0.elapsed().as_secs_f64();
-        let market = Arc::new(app.cache.market(&symbols, last)?);
+        let mut market = app.cache.market(&symbols, last)?;
+        // A symbol whose real data is incomplete this bar (a sync failure or an
+        // exchange gap) sits out; a held one must be complete or the bar fails.
+        let incomplete: Vec<(String, String)> = (0..market.symbols.len())
+            .filter_map(|s| {
+                let e = market.validate_symbol(s).err()?;
+                Some((market.symbols[s].clone(), format!("{e:#}")))
+            })
+            .collect();
+        if !incomplete.is_empty() {
+            let held: Vec<String> = app
+                .paper
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|ps| {
+                    ps.portfolio
+                        .positions
+                        .iter()
+                        .map(|p| p.symbol.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some((_, e)) = incomplete.iter().find(|(s, _)| held.contains(s)) {
+                anyhow::bail!("held symbol data incomplete: {e}");
+            }
+            symbols.retain(|s| incomplete.iter().all(|(x, _)| x != s));
+            app.event(
+                "WARN",
+                format!(
+                    "{} symbol(s) skipped this bar for incomplete real data (first: {})",
+                    incomplete.len(),
+                    incomplete[0].1
+                ),
+            );
+            market = app.cache.market(&symbols, last)?;
+        }
+        let market = Arc::new(market);
         hb.beat();
         // The walk-forward sizes from the money actually in play: the paper
         // account's equity (which follows the real balance), else the real balance.
-        let wf_equity = app
+        let wf_equity = (app
             .paper
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map_or(balance, |ps| {
                 ps.portfolio.equity + ps.portfolio.unrealized()
-            });
+            })
+            - account.reserved())
+        .max(0.0);
         let m2 = market.clone();
         let (sc, report) = tokio::task::spawn_blocking(move || -> Result<_> {
             let sc = scores::compute(&m2, walkforward::UNIVERSE);
@@ -335,7 +534,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         .await??;
         hb.beat();
         last_done = last;
-        let n = market.len();
+        let n = market.ts.len();
 
         let prev_params = app
             .paper
@@ -348,25 +547,25 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             // while the walk-forward passes; otherwise it goes flat.
             let new_lines = {
                 let mut guard = app.paper.write().unwrap_or_else(|e| e.into_inner());
-                let ps = guard.get_or_insert_with(|| PaperState {
+                let mut candidate = guard.clone().unwrap_or_else(|| PaperState {
+                    schema_version: 2,
+                    settlements_seen: Default::default(),
                     portfolio: XsPortfolio::new(balance),
                     last_ts: market.ts[n - 1] - BAR_MS,
                     params: None,
                     last_account_balance: Some(balance),
                 });
+                let ps = &mut candidate;
                 // A change in the real balance (the account is flat: the bot never
                 // trades) is a deposit or withdrawal: mirror it, not as profit.
                 let mut flow = None;
                 if let Some(prev) = ps.last_account_balance {
                     let delta = balance - prev;
-                    if delta.abs() >= 0.01 {
-                        ps.portfolio.cash_flow(delta);
+                    if delta != 0.0 {
                         flow = Some(delta);
                     }
                 }
-                ps.last_account_balance = Some(balance);
-                ps.params = Some(p.clone());
-                ps.portfolio.entries_allowed = report.passed || report.forward_ok();
+
                 let (before_trades, before_pos): (usize, Vec<(String, Side, bool)>) = (
                     ps.portfolio.trades.len(),
                     ps.portfolio
@@ -376,15 +575,19 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                         .collect(),
                 );
                 // The symbol list is re-fetched every bar: re-point positions by name.
-                ps.portfolio.reindex(&market.symbols, market.ts[n - 1]);
-                for t in 0..n {
-                    if market.ts[t] > ps.last_ts {
-                        ps.portfolio.step(&market, &sc, t, &p);
-                        ps.last_ts = market.ts[t];
-                    }
-                }
+                ps.portfolio.reindex(&market.symbols);
+                advance_paper(
+                    ps,
+                    &market,
+                    &sc,
+                    &p,
+                    report.passed || report.forward_ok(),
+                    chrono::Utc::now().timestamp_millis(),
+                    Some(account),
+                )?;
+                persist_paper(&app.dir.join(PAPER_FILE), ps)?;
                 let mut lines: Vec<String> = flow
-                    .map(|d| format!("ACCOUNT balance changed {d:+.2} USDT (now {balance:.2}): mirrored into paper as a {}, not profit", if d > 0.0 { "deposit" } else { "withdrawal" }))
+                    .map(|d| format!("ACCOUNT observed external wallet change {d:+.8} USDT (now {balance:.8}): paper capital adjusted after replay; source unclassified"))
                     .into_iter()
                     .collect();
                 lines.extend(ps.portfolio.trades[before_trades..].iter().map(|t| {
@@ -401,8 +604,8 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                     let before = before_pos.iter().find(|b| b.0 == x.symbol && b.1 == x.side);
                     if before.is_some_and(|b| !b.2) && x.added {
                         lines.push(format!(
-                            "PAPER add {:?} {}: closed 10% against, size doubled, average now {} (liquidation {:.6})",
-                            x.side, x.symbol, x.entry, x.liquidation
+                            "PAPER add {:?} {}: closed {}% against, size doubled, average now {} (liquidation {:.6})",
+                            x.side, x.symbol, p.risk.add_pct.unwrap_or_default(), x.entry, x.liquidation
                         ));
                     }
                     if before.is_none() {
@@ -416,16 +619,26 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                         ));
                     }
                 }
+                *guard = Some(candidate);
                 lines
             };
             for l in new_lines {
                 app.event("INFO", l);
             }
-            app.save_paper();
+            app.save_paper()?;
 
             // Signals at the latest bar.
             let t = n - 1;
-            let targets = xs::targets(&market, &sc, t, &p);
+            let targets = if report.passed || report.forward_ok() {
+                app.paper
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|ps| ps.portfolio.executable_targets(&market, &sc, t, &p))
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            };
             let held: Vec<(usize, Side)> = app
                 .paper
                 .read()
@@ -466,19 +679,12 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         let mut s = app.status.write().unwrap_or_else(|e| e.into_inner());
         s.last_bar_ts = last;
         s.account_balance = balance;
+        s.account_reserved = account.reserved();
         s.account_balance_ts = chrono::Utc::now().timestamp_millis();
         s.next_rebalance_ts = next_rebalance;
         s.symbols = symbols.len();
         s.sync_secs = sync_secs;
         s.validated = report.passed;
-        s.mode = if report.passed {
-            "PASSED"
-        } else if report.forward_ok() {
-            "FORWARD TEST"
-        } else {
-            "FAILED (flat)"
-        }
-        .into();
         s.params = report.params.clone();
         if let Some(ps) = paper.as_ref() {
             let m = ps.portfolio.metrics();
@@ -491,7 +697,19 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             s.paper_realized = m.end_equity - m.start_equity;
             s.paper_open = m.open_unrealized;
             s.paper_max_drawdown_pct = m.max_drawdown_pct;
+            s.effective_pairs = ps.portfolio.effective_top;
+            s.allocation_note = ps.portfolio.allocation_note.clone();
         }
+        s.mode = if report.passed {
+            "PASSED"
+        } else if report.forward_ok() {
+            "FORWARD TEST"
+        } else if s.paper_open_positions > 0 {
+            "FAILED (exits pending)"
+        } else {
+            "FAILED (flat)"
+        }
+        .into();
         let verdict = if report.passed {
             "PASSED".to_string()
         } else if report.forward_ok() {
@@ -595,7 +813,7 @@ table{border-collapse:collapse;font-size:12px}td,th{padding:2px 8px;text-align:r
 <div class=k id=strat></div>
 <section><div class=grid id=cards></div></section>
 <section><b>Paper positions</b> <span class=k id=nextreb></span><table id=pos></table></section>
-<section><b>Next rebalance targets</b> <span class=k>(at the next rebalance: long the 5 most bearish Pulse, short the 5 most bullish, among the top 100 USDT perps by 24h turnover)</span><table id=sig></table></section>
+<section><b>Next rebalance targets</b> <span class=k id=sighelp></span><table id=sig></table></section>
 <section><b>Live event log</b><pre id=ev></pre></section>
 <section><b>Recent paper trades</b><table id=tr></table></section>
 <section><b>Forward test, day by day</b> <span class=k>(14 days of real Bybit data the settings never saw: chosen on the previous 14 days, then traded these 14; same engine, fees, slippage, funding and lot rules as paper)</span><div id=fsum class=k></div><div id=fchart></div><table id=fdays></table></section>
@@ -605,14 +823,15 @@ const f=(x,d=2)=>x==null||isNaN(x)?'-':Number(x).toFixed(d);
 const t=ms=>ms?new Date(ms).toLocaleString():'-';
 async function tick(){try{
 const s=await (await fetch('/api/status')).json(), g=await (await fetch('/api/signals')).json();
-document.getElementById('strat').textContent=s.strategy+' — last update '+t(s.now_ms);
+document.getElementById('strat').textContent=s.strategy+' — last update '+t(s.last_bar_ts+900000);
 const sg=x=>(x>=0?'+':'')+f(x), pc=x=>sg(x)+'%', st=s.paper_start_equity||1;
 const pu=p=>(p.side==="Long"?1:-1)*(p.mark-p.entry)*p.qty-p.fees-p.funding;
-const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(Bybit, read-only, '+t(s.account_balance_ts)+')</span>'],['Paper equity',f(s.paper_equity)+' USDT <span class=k>('+pc((s.paper_equity/st-1)*100)+' from '+f(st,0)+')</span>'],['Realised P&L <span class=k title="closed trades + fees and funding already paid">ⓘ</span>','<span class='+(s.paper_realized>=0?'ok':'bad')+'>'+sg(s.paper_realized)+' USDT ('+pc(s.paper_realized/st*100)+')</span>'],['Open P&L <span class=k title="open positions marked at the last close">ⓘ</span>','<span class='+(s.paper_open>=0?'ok':'bad')+'>'+sg(s.paper_open)+' USDT ('+pc(s.paper_open/st*100)+')</span>'],['Open positions',s.paper_open_positions],
+const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(Bybit, read-only, '+f(s.account_reserved)+' committed elsewhere, '+t(s.account_balance_ts)+')</span>'],['Paper equity',f(s.paper_equity)+' USDT <span class=k>('+pc((s.paper_equity/st-1)*100)+' from '+f(st,0)+')</span>'],['Realised P&L <span class=k title="closed trades + fees and funding already paid">ⓘ</span>','<span class='+(s.paper_realized>=0?'ok':'bad')+'>'+sg(s.paper_realized)+' USDT ('+pc(s.paper_realized/st*100)+')</span>'],['Open P&L <span class=k title="open positions marked at the last close">ⓘ</span>','<span class='+(s.paper_open>=0?'ok':'bad')+'>'+sg(s.paper_open)+' USDT ('+pc(s.paper_open/st*100)+')</span>'],['Open positions',s.paper_open_positions],['Dynamic allocation',s.effective_pairs+' pairs <span class=k>'+s.allocation_note+'</span>'],
 ['Closed trades / wins',s.paper_trades+' / '+s.paper_wins],['Max drawdown',f(s.paper_max_drawdown_pct,1)+'%'],
 ['Walk-forward',s.report?'<span class='+(s.validated?'ok':s.mode==='FORWARD TEST'?'warn':'bad')+'>'+s.mode+'</span>':'…'],
 ['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
 ['Tasks',Object.entries(s.tasks||{}).map(([k,v])=>k+(v.running?' ✓':' ✗')).join(' ')]];
+document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+' most bearish Pulse, short the '+s.effective_pairs+' most bullish, among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
 document.getElementById('cards').innerHTML=cards.map(c=>`<div class=card><span class=k>${c[0]}</span><b>${c[1]}</b></div>`).join('');
 document.getElementById('nextreb').textContent=s.next_rebalance_ts?'next rebalance at '+t(s.next_rebalance_ts)+(s.params?' (every '+s.params.hold*15+' min)':''):'';
 document.getElementById('pos').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Mark<th>P&L USDT (after its fees + funding)<th>P&L % (margin)<th>Stop<th>Lev<th>Opened</tr>'+(s.paper_positions||[]).map(p=>{
@@ -667,3 +886,101 @@ let boot=null;
 async function guard(){try{const s=await (await fetch('/api/status')).json();if(boot&&s.started_ms!==boot)location.reload();boot=s.started_ms;}catch(e){}}
 tick();guard();setInterval(tick,5000);setInterval(guard,15000);
 </script>"#;
+
+#[cfg(test)]
+mod causal_tests {
+    use super::*;
+    #[test]
+    fn new_report_does_not_change_replayed_bars() {
+        let mut market = bybit_mean_reversion_bot::engine::Market {
+            marks: Vec::new(),
+            listing_times: Vec::new(),
+            entry_eligible: Vec::new(),
+            ts: (0..200).map(|i| i * BAR_MS).collect(),
+            symbols: vec!["A".into(), "B".into()],
+            bars: [-0.1, 0.1]
+                .iter()
+                .map(|drift| {
+                    (0..200)
+                        .map(|i| {
+                            let price = 100.0 * (1.0 + drift * i as f64 / 200.0);
+                            Some(bybit_mean_reversion_bot::engine::Bar {
+                                open: price,
+                                high: price,
+                                low: price,
+                                close: price,
+                                volume: 1.0,
+                                turnover: 100.0,
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+            rules: vec![
+                Some(bybit_mean_reversion_bot::engine::rules::Rules {
+                    qty_step: 0.0,
+                    min_qty: 0.0,
+                    min_notional: 5.0,
+                    max_market_qty: 1e12,
+                    taker_fee: 0.00055,
+                    mm_tiers: vec![bybit_mean_reversion_bot::engine::rules::MarginTier {
+                        limit: 1e12,
+                        rate: 0.01,
+                        deduction: 0.0,
+                        max_leverage: 100.0
+                    }],
+                    book: vec![(6400.0, 0.0002, 0.0002)],
+                    book_ts: 0
+                });
+                2
+            ],
+            funding: vec![vec![]; 2],
+        };
+        market.marks = market.bars.clone();
+        let sc = scores::compute(&market, 100);
+        let old = XsParams {
+            signal: xs::Signal::Return,
+            flip: false,
+            lookback: 1,
+            hold: 2,
+            top: 1,
+            gross_leverage: 1.0,
+            stop_pct: None,
+            risk: xs::Risk::default(),
+        };
+        let mut next = old.clone();
+        next.hold = 4;
+        let mut ps = PaperState {
+            schema_version: 2,
+            settlements_seen: Default::default(),
+            portfolio: XsPortfolio::new(1000.0),
+            last_ts: 175 * BAR_MS,
+            params: Some(old.clone()),
+            last_account_balance: None,
+        };
+        ps.portfolio.entries_allowed = false;
+        let mut expected = ps.portfolio.clone();
+        for t in 176..200 {
+            expected.step(&market, &sc, t, &old);
+        }
+        expected.install_entry_gate(true);
+        expected.decide_close(&market, &sc, 199, &next);
+        expected.defer_new_decisions(market.ts[199] + BAR_MS);
+        advance_paper(
+            &mut ps,
+            &market,
+            &sc,
+            &next,
+            true,
+            market.ts[199] + BAR_MS,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&ps.portfolio).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(ps.params.unwrap().hold, 4);
+        assert_eq!(ps.last_ts, 199 * BAR_MS);
+    }
+}

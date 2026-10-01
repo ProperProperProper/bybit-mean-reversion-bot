@@ -31,9 +31,14 @@ async fn backtest() -> Result<()> {
     let creds = bybit_mean_reversion_bot::engine::keychain::load()?;
     let balance = client.usdt_wallet_balance(&creds).await?;
     let lots = client.usdt_perpetual_lots().await?;
+    let lots = client
+        .top_margin_tokens(&lots, walkforward::UNIVERSE)
+        .await?;
+    cache.put_instruments(&lots)?;
     eprintln!("real account balance {balance:.2} USDT; measuring Bybit rules (fees, margin tiers, order books)...");
     cache.put_rules(&client.fetch_rules(&creds, &lots).await?)?;
-    let symbols: Vec<String> = lots.into_iter().map(|(s, _)| s).collect();
+    let symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
+    cache.put_universe(&symbols)?;
     eprintln!(
         "{} USDT perpetuals; syncing closed 15m bars + funding...",
         symbols.len()

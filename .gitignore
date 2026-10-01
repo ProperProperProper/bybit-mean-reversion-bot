@@ -12,3 +12,7 @@ secrets*
 .DS_Store
 /data/
 /.claude/
+*.db
+*.db-shm
+*.db-wal
+paper_*.json

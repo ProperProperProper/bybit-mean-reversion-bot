@@ -1,6 +1,7 @@
 //! Bybit API credentials from the macOS Keychain (never from files or env vars),
-//! used READ-ONLY here: only to read the account's own fee rates. This bot never
-//! places orders.
+//! used READ-ONLY: to read the account's own fee rates and USDT wallet balance.
+//! The credentials are kept in memory only, never written or logged, and this
+//! bot never places orders.
 
 use anyhow::{anyhow, Context, Result};
 use std::process::Command;

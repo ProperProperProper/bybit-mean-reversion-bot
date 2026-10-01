@@ -6,39 +6,15 @@
 //! tested on its own. Start equity = the real account balance (or EQ=...);
 //! real Bybit data and rules (window_{1,2,3}.db).
 use bybit_mean_reversion_bot::engine::xs::{Risk, XsParams};
-use bybit_mean_reversion_bot::engine::{
-    data::Cache, scores, walkforward, xs, Market, BARS, BAR_MS,
-};
+use bybit_mean_reversion_bot::engine::{research, scores, walkforward, xs, Market, BARS};
 use std::time::{Duration, Instant};
 
-const WINDOW_3_FIRST_BAR: i64 = 1_789_633_800_000;
-
-/// Start equity: the real account's USDT wallet balance (read-only), or EQ=... to
-/// study another size explicitly. Never a built-in default.
-fn start_equity() -> anyhow::Result<f64> {
-    if let Ok(v) = std::env::var("EQ") {
-        return Ok(v.parse()?);
-    }
-    tokio::runtime::Runtime::new()?.block_on(async {
-        let creds = bybit_mean_reversion_bot::engine::keychain::load()?;
-        bybit_mean_reversion_bot::engine::data::Client::new()?
-            .usdt_wallet_balance(&creds)
-            .await
-    })
-}
-
 fn main() -> anyhow::Result<()> {
-    let eq = start_equity()?;
+    let eq = research::start_equity()?;
     println!("start equity {eq:.2} USDT");
     let dir = bybit_mean_reversion_bot::engine::runtime_dir();
-    let span = BARS as i64 * BAR_MS;
-    let w3_last = WINDOW_3_FIRST_BAR + span - BAR_MS;
-    let markets: Vec<Market> = (1..=3i64)
-        .map(|k| {
-            let c = Cache::open(dir.join(format!("window_{k}.db")).to_str().unwrap())?;
-            let (symbols, _) = c.contents()?;
-            c.market(&symbols, w3_last - (3 - k) * span)
-        })
+    let markets: Vec<Market> = (1..=3)
+        .map(|k| research::load_window(&dir, k))
         .collect::<anyhow::Result<_>>()?;
     let sc: Vec<_> = markets
         .iter()

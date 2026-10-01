@@ -17,13 +17,17 @@ pub struct Trade {
     pub fees: f64,
     pub funding: f64,
     pub pnl: f64,
-    /// pnl / margin (or deal funds) committed.
+    /// pnl / margin posted for the position.
     pub r: f64,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
+    #[serde(default)]
+    pub execution_error: Option<String>,
+    #[serde(default)]
+    pub rejected_rebalances: usize,
     pub start_equity: f64,
     pub end_equity: f64,
     pub open_unrealized: f64,
@@ -33,7 +37,6 @@ pub struct Metrics {
     pub gross_loss: f64,
     pub liquidations: usize,
     pub max_drawdown_pct: f64,
-    pub avg_r: f64,
 }
 
 impl Metrics {
@@ -45,13 +48,6 @@ impl Metrics {
             self.net() / self.start_equity * 100.0
         } else {
             0.0
-        }
-    }
-    pub fn win_rate(&self) -> f64 {
-        if self.trades == 0 {
-            0.0
-        } else {
-            self.wins as f64 / self.trades as f64 * 100.0
         }
     }
     pub fn profit_factor(&self) -> f64 {

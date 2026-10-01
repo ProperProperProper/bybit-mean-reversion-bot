@@ -11,6 +11,7 @@
 //!   contrarian Pulse, `walkforward::LIVE_SIGNAL`), with optional drawdown rules.
 //! * `walkforward` — the 14-day walk-forward gate and the strategy grids.
 //! * `metrics` — trade records and performance metrics.
+//! * `research` — the three fixed 14-day research windows and research start equity.
 //! * `governor`, `supervisor`, `keychain` — CPU cap, task restarts, credentials.
 //!
 //! Decisions are made at a bar's close and filled at the next open (or at a
@@ -21,6 +22,7 @@ pub mod data;
 pub mod governor;
 pub mod keychain;
 pub mod metrics;
+pub mod research;
 pub mod rules;
 pub mod scores;
 pub mod supervisor;
@@ -60,7 +62,13 @@ pub struct Bar {
 pub struct Market {
     pub ts: Vec<i64>,
     pub symbols: Vec<String>,
+    /// Exchange launch timestamps, ms. None means unverified listing history.
+    pub listing_times: Vec<Option<i64>>,
+    /// Held symbols outside the current top 50 remain managed but cannot re-enter.
+    pub entry_eligible: Vec<bool>,
     pub bars: Vec<Vec<Option<Bar>>>,
+    /// Exchange mark-price OHLC. Never substitute traded prices in production.
+    pub marks: Vec<Vec<Option<Bar>>>,
     /// Real settled funding (timestamp ms, rate) per symbol, ascending.
     pub funding: Vec<Vec<(i64, f64)>>,
     /// Bybit trading rules per symbol (`rules::Rules`: order rules, account fee,
@@ -69,6 +77,77 @@ pub struct Market {
 }
 
 impl Market {
+    /// Reject incomplete or malformed real data before evaluating a strategy.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let n = self.symbols.len();
+        let bars = self.ts.len();
+        anyhow::ensure!(
+            bars > 0 && self.ts.windows(2).all(|w| w[1] - w[0] == BAR_MS),
+            "invalid market timeline"
+        );
+        anyhow::ensure!(
+            self.bars.len() == n
+                && self.marks.len() == n
+                && self.funding.len() == n
+                && self.rules.len() == n
+                && self.listing_times.len() == n,
+            "market shape mismatch or missing listing metadata"
+        );
+        for s in 0..n {
+            self.validate_symbol(s)?;
+        }
+        Ok(())
+    }
+
+    /// One symbol's rows: complete traded and mark candles after listing, sane
+    /// OHLC, ascending finite funding.
+    pub fn validate_symbol(&self, s: usize) -> anyhow::Result<()> {
+        let bars = self.ts.len();
+        anyhow::ensure!(
+            self.bars[s].len() == bars && self.marks[s].len() == bars,
+            "market row shape mismatch: {}",
+            self.symbols[s]
+        );
+        let launch = self.listing_times[s]
+            .ok_or_else(|| anyhow::anyhow!("{}: unverified listing time", self.symbols[s]))?;
+        let eligible = ((launch + BAR_MS - 1) / BAR_MS) * BAR_MS;
+        for t in 0..bars {
+            if self.ts[t] < eligible {
+                continue;
+            }
+            for (name, bar) in [("traded", self.bars[s][t]), ("mark", self.marks[s][t])] {
+                let b = bar.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: missing {name} candle at {}",
+                        self.symbols[s],
+                        self.ts[t]
+                    )
+                })?;
+                anyhow::ensure!(
+                    [b.open, b.high, b.low, b.close, b.volume, b.turnover]
+                        .iter()
+                        .all(|v| v.is_finite())
+                        && b.open > 0.0
+                        && b.low > 0.0
+                        && b.high >= b.open.max(b.close).max(b.low)
+                        && b.low <= b.open.min(b.close)
+                        && b.volume >= 0.0
+                        && b.turnover >= 0.0,
+                    "{}: invalid {name} candle at {}",
+                    self.symbols[s],
+                    self.ts[t]
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.funding[s].windows(2).all(|w| w[0].0 < w[1].0)
+                && self.funding[s].iter().all(|(_, v)| v.is_finite()),
+            "{}: malformed funding history",
+            self.symbols[s]
+        );
+        Ok(())
+    }
+
     /// The symbol's Bybit rules; None means the symbol must not be traded.
     pub fn rules(&self, sym: usize) -> Option<&rules::Rules> {
         self.rules.get(sym).and_then(|r| r.as_ref())
@@ -97,21 +176,48 @@ impl Market {
             ..Default::default()
         };
         for s in &out.symbols {
-            let (mut bars, mut funding) = (Vec::with_capacity(out.ts.len()), Vec::new());
+            let (mut bars, mut marks, mut funding) = (
+                Vec::with_capacity(out.ts.len()),
+                Vec::with_capacity(out.ts.len()),
+                Vec::new(),
+            );
             for m in parts {
                 match m.symbols.iter().position(|x| x == s) {
                     Some(i) => {
                         bars.extend_from_slice(&m.bars[i]);
+                        marks.extend_from_slice(&m.marks[i]);
                         for &f in &m.funding[i] {
                             if funding.last().is_none_or(|l: &(i64, f64)| f.0 > l.0) {
                                 funding.push(f);
                             }
                         }
                     }
-                    None => bars.extend(std::iter::repeat_n(None, m.ts.len())),
+                    None => {
+                        bars.extend(std::iter::repeat_n(None, m.ts.len()));
+                        marks.extend(std::iter::repeat_n(None, m.ts.len()));
+                    }
                 }
             }
+            let launches: Vec<i64> = parts
+                .iter()
+                .filter_map(|m| {
+                    let i = m.symbols.iter().position(|x| x == s)?;
+                    m.listing_times.get(i).copied().flatten()
+                })
+                .collect();
+            anyhow::ensure!(
+                launches.iter().all(|t| Some(t) == launches.first()),
+                "conflicting listing times for {s}"
+            );
+            out.entry_eligible.push(parts.iter().any(|m| {
+                m.symbols
+                    .iter()
+                    .position(|x| x == s)
+                    .is_some_and(|i| m.entry_eligible.get(i).copied().unwrap_or(true))
+            }));
+            out.listing_times.push(launches.first().copied());
             out.bars.push(bars);
+            out.marks.push(marks);
             out.funding.push(funding);
             // The most recent part's rules (they are measured, newest is best).
             out.rules.push(parts.iter().rev().find_map(|m| {
@@ -120,13 +226,6 @@ impl Market {
             }));
         }
         Ok(out)
-    }
-
-    pub fn len(&self) -> usize {
-        self.ts.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.ts.is_empty()
     }
 }
 
@@ -153,7 +252,10 @@ mod tests {
         Market {
             ts: m.ts[r.clone()].to_vec(),
             symbols: m.symbols.clone(),
+            listing_times: m.listing_times.clone(),
+            entry_eligible: m.entry_eligible.clone(),
             bars: m.bars.iter().map(|b| b[r.clone()].to_vec()).collect(),
+            marks: m.marks.iter().map(|b| b[r.clone()].to_vec()).collect(),
             funding: m.funding.clone(),
             rules: m.rules.clone(),
         }

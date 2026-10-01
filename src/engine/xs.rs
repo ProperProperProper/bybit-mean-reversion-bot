@@ -1,4 +1,4 @@
-//! Cross-sectional, market-neutral portfolio over the top-100 USDT perpetuals.
+//! Cross-sectional, market-neutral portfolio over the top-50 USDT perpetuals.
 //! Every `hold` bars (aligned to timestamps, so backtest and live rebalance at
 //! the same closes) rank the universe by a causal `Signal` (screener scores,
 //! return or settled funding), then hold LONG the `top` lowest and SHORT the
@@ -12,6 +12,16 @@ use super::{Market, Side, BAR_MS};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// No new position or add is placed while the free balance (after every
+/// posted margin, including margin other positions hold on the real account)
+/// is below this many USDT.
+pub const MIN_ENTRY_BALANCE: f64 = 5.0;
+/// Long and short gross notional may differ by at most this fraction.
+pub const NEUTRAL_TOLERANCE: f64 = 0.02;
+/// Share of the free balance a rebalance commits: the rest covers closing the
+/// outgoing positions (fees, book cost) between the decision and the fill.
+const SLOT_HEADROOM: f64 = 0.99;
+
 /// What the universe is ranked by at each rebalance close. All are causal:
 /// screener scores from closed bars up to t, funding already settled by bar t.
 /// LONG the `top` lowest values, SHORT the `top` highest (`flip` reverses).
@@ -22,7 +32,7 @@ pub enum Signal {
     Return,
     /// Screener trend score 1-100, bearish to bullish.
     TrendScore,
-    /// Screener signed moving-average price-action strength.
+    /// Screener directional moving-average price-action percentile (bearish to bullish).
     PriceAction,
     /// Screener multi-interval volatility score (unflipped = low-vol long).
     Volatility,
@@ -44,7 +54,9 @@ pub struct XsParams {
     pub lookback: usize,
     pub hold: usize,
     pub top: usize,
-    /// Notional per position = equity * gross_leverage / (2 * top).
+    /// Leverage of each position. Each of the 2 * `top` slots gets a budget of
+    /// equity / (2 * top) (halved again when `risk.add_pct` must stay fundable)
+    /// for margin + entry fee, so total exposure is about equity * gross_leverage.
     pub gross_leverage: f64,
     /// Intrabar stop: close the moment price touches this % against the entry.
     pub stop_pct: Option<f64>,
@@ -87,6 +99,7 @@ pub enum NextAction {
     Stop,
     TakeProfit,
     Add,
+    Rebalance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,28 +117,50 @@ pub struct XsPosition {
     pub stop: Option<f64>,
     pub fees: f64,
     pub funding: f64,
+    #[serde(default)]
+    pub last_funding_ts: Option<i64>,
     pub mark: f64,
     #[serde(default)]
     pub next_action: Option<NextAction>,
+    #[serde(default)]
+    pub action_not_before: i64,
     /// Already added to once.
     #[serde(default)]
     pub added: bool,
     /// The account's Bybit taker fee for this symbol at entry.
     pub fee_rate: f64,
-    /// Measured order-book cost of closing this size at entry (used only if
-    /// the symbol's rules disappear, e.g. delisting).
-    pub exit_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XsPortfolio {
     pub equity: f64,
+    /// A failed execution/data precondition invalidates the simulation, never a fake fill.
+    #[serde(default)]
+    pub execution_error: Option<String>,
+    #[serde(default)]
+    pub rejected_rebalances: usize,
+    #[serde(default)]
+    pub effective_top: usize,
+    #[serde(default)]
+    pub allocation_note: String,
+    /// USDT the real account has committed elsewhere (other positions' and
+    /// orders' initial margin, locked funds): never available to this bot.
+    #[serde(default)]
+    pub reserved: f64,
     start_equity: f64,
     pub positions: Vec<XsPosition>,
     /// Target set decided at the last rebalance close, executed at the next open.
     /// Carries symbol names so it survives the live symbol list changing.
     #[serde(default)]
     pending_targets: Option<Vec<(usize, String, Side)>>,
+    #[serde(default)]
+    pending_params: Option<XsParams>,
+    #[serde(default)]
+    pending_not_before: i64,
+    /// Margin + entry fee per slot fixed at the decision close, so the fill
+    /// uses exactly the sizes whose lot rounding was checked then.
+    #[serde(default)]
+    pending_slot: f64,
     pub trades: Vec<Trade>,
     peak: f64,
     max_dd: f64,
@@ -213,7 +248,7 @@ pub fn signal_value(
             now / then - 1.0
         }
         Signal::TrendScore => sc.trend_score,
-        Signal::PriceAction => sc.pa_strength,
+        Signal::PriceAction => sc.price_action_score,
         Signal::Volatility => sc.volatility_score,
         Signal::Rsi => sc.rsi14,
         Signal::Pulse => sc.pulse_long? - sc.pulse_short?,
@@ -229,9 +264,42 @@ pub fn targets(
     t: usize,
     p: &XsParams,
 ) -> BTreeMap<usize, Side> {
+    ranked_targets(m, scores, t, p, None)
+}
+
+fn ranked_targets(
+    m: &Market,
+    scores: &[Vec<Option<Score>>],
+    t: usize,
+    p: &XsParams,
+    budget: Option<(f64, f64)>,
+) -> BTreeMap<usize, Side> {
     let mut out = BTreeMap::new();
+    if p.top == 0 {
+        return out;
+    }
     let mut ranked: Vec<(usize, f64)> = (0..m.symbols.len())
-        .filter_map(|s| Some((s, signal_value(m, scores, s, t, p)?)))
+        .filter_map(|s| {
+            let value = signal_value(m, scores, s, t, p)?;
+            if let Some((margin, cm)) = budget {
+                let (bar, r) = (m.bars[s][t]?, m.rules(s)?);
+                let notional = (margin / (1.0 / p.gross_leverage + r.taker_fee * cm))
+                    .min(r.order_notional_cap(bar.close)?);
+                for side in [Side::Long, Side::Short] {
+                    let cost = r.book_cost(notional, side == Side::Long)?;
+                    let price = bar.close * (1.0 + side.sign() * cost * cm);
+                    let qty = r.order_qty(notional / price, price)?;
+                    // Lot rounding must not unbalance the legs: a contract whose
+                    // step is coarse for this slot size cannot be held neutrally.
+                    if qty * price < notional * (1.0 - NEUTRAL_TOLERANCE / 2.0)
+                        || !r.leverage_allowed(qty * price, p.gross_leverage)
+                    {
+                        return None;
+                    }
+                }
+            }
+            Some((s, value))
+        })
         .collect();
     if ranked.len() < 2 * p.top {
         return out;
@@ -246,13 +314,47 @@ pub fn targets(
     out
 }
 
+/// Reduce pair count until the balance can fund the contracts' actual lot rules.
+fn funded_targets(
+    m: &Market,
+    scores: &[Vec<Option<Score>>],
+    t: usize,
+    p: &XsParams,
+    equity: f64,
+    cost_mult: f64,
+    scale: f64,
+) -> (BTreeMap<usize, Side>, usize, f64) {
+    if equity < MIN_ENTRY_BALANCE {
+        return (BTreeMap::new(), 0, 0.0);
+    }
+    let adds = if p.risk.add_pct.is_some() { 2.0 } else { 1.0 };
+    for top in (1..=p.top.min(m.symbols.len() / 2)).rev() {
+        let mut adaptive = p.clone();
+        adaptive.top = top;
+        let budget = equity * scale * SLOT_HEADROOM / (2 * top) as f64 / adds;
+        let target = ranked_targets(m, scores, t, &adaptive, Some((budget, cost_mult)));
+        if target.len() == 2 * top {
+            return (target, top, budget);
+        }
+    }
+    (BTreeMap::new(), 0, 0.0)
+}
+
 impl XsPortfolio {
     pub fn new(equity: f64) -> Self {
         XsPortfolio {
             equity,
+            execution_error: None,
+            rejected_rebalances: 0,
+            effective_top: 0,
+            allocation_note: String::new(),
+            reserved: 0.0,
             start_equity: equity,
             positions: vec![],
             pending_targets: None,
+            pending_params: None,
+            pending_not_before: 0,
+            pending_slot: 0.0,
             trades: vec![],
             peak: equity,
             max_dd: 0.0,
@@ -283,7 +385,7 @@ impl XsPortfolio {
     /// list is re-fetched every bar, so indices shift when Bybit lists a coin;
     /// a held position whose symbol is gone (delisted or delisting scheduled)
     /// is closed at its last mark and never traded again.
-    pub fn reindex(&mut self, symbols: &[String], ts: i64) {
+    pub fn reindex(&mut self, symbols: &[String]) {
         let idx: std::collections::HashMap<&str, usize> = symbols
             .iter()
             .enumerate()
@@ -297,8 +399,11 @@ impl XsPortfolio {
                     i += 1;
                 }
                 None => {
-                    let mark = self.positions[i].mark;
-                    self.close(i, ts, mark, "Delisted");
+                    self.execution_error = Some(format!(
+                        "{}: held symbol missing; exchange settlement data required",
+                        self.positions[i].symbol
+                    ));
+                    return;
                 }
             }
         }
@@ -334,34 +439,101 @@ impl XsPortfolio {
         });
     }
 
-    /// Fill price of a market order closing position i when the price is
-    /// `reference`: the measured order-book cost for that size (a long sells
-    /// into the bids, a short buys from the asks). Beyond the measured depth the
-    /// cost of the deepest measured size is scaled up linearly (worse, never better).
-    fn exit_price(&self, m: &Market, i: usize, reference: f64) -> f64 {
+    /// A close must fit the measured book. Extrapolated or nonpositive prices
+    /// invalidate the simulation rather than becoming invented fills.
+    fn exit_price(&self, m: &Market, i: usize, reference: f64) -> Option<f64> {
         let pos = &self.positions[i];
-        let notional = pos.qty * reference;
-        let buy = pos.side == Side::Short;
-        let cost = m.rules(pos.sym).map_or(pos.exit_cost, |r| {
-            r.book_cost(notional, buy).unwrap_or_else(|| {
-                r.book.last().map_or(pos.exit_cost, |&(n, b, s)| {
-                    (if buy { b } else { s }) * notional / n
-                })
-            })
-        });
-        reference * (1.0 - pos.side.sign() * cost * self.cost_mult)
+        let cost = m
+            .rules(pos.sym)?
+            .book_cost(pos.qty * reference, pos.side == Side::Short)?;
+        let price = reference * (1.0 - pos.side.sign() * cost * self.cost_mult);
+        (price.is_finite() && price > 0.0).then_some(price)
     }
 
-    /// Margin not yet posted (isolated margin: balance minus position margins).
-    fn available(&self) -> f64 {
-        self.equity - self.positions.iter().map(|x| x.margin).sum::<f64>()
+    fn close_market(
+        &mut self,
+        m: &Market,
+        i: usize,
+        ts: i64,
+        reference: f64,
+        reason: &str,
+    ) -> bool {
+        if let Some(price) = self.exit_price(m, i, reference) {
+            self.close(i, ts, price, reason);
+            true
+        } else {
+            self.execution_error = Some(format!(
+                "{}: {reason} cannot fill within measured book depth",
+                self.positions[i].symbol
+            ));
+            false
+        }
     }
 
-    /// Market order at bar t's open spending `budget` USDT on margin + fee: Bybit lot rules, the measured order-book cost for this size, the
-    /// account's taker fee, the real margin tier. Not placed when the symbol has no
+    /// Funding consumes free cash first, then this position's isolated margin.
+    fn charge_funding(&mut self, m: &Market, i: usize, ts: i64, rate: f64, mark: f64) {
+        if self.positions[i].last_funding_ts == Some(ts) {
+            return;
+        }
+        let cost = self.positions[i].side.sign() * rate * self.positions[i].qty * mark;
+        let debit = (cost - self.available().max(0.0)).max(0.0);
+        self.equity -= cost;
+        let pos = &mut self.positions[i];
+        pos.funding += cost;
+        pos.last_funding_ts = Some(ts);
+        pos.margin = (pos.margin - debit).max(0.0);
+        if let Some(price) = m.rules(pos.sym).and_then(|r| {
+            r.liquidation_price(pos.side, pos.qty, pos.entry, pos.margin, self.cost_mult)
+        }) {
+            pos.liquidation = price;
+        } else {
+            self.execution_error = Some(format!(
+                "{}: no valid liquidation tier after funding",
+                pos.symbol
+            ));
+        }
+    }
+
+    fn liquidate(&mut self, i: usize, ts: i64) {
+        let (liq, margin) = (self.positions[i].liquidation, self.positions[i].margin);
+        self.liquidations += 1;
+        self.close(i, ts, liq, "Liquidated");
+        if let Some(tr) = self.trades.last_mut() {
+            let floor = -margin - tr.fees - tr.funding;
+            if tr.pnl < floor {
+                self.equity += floor - tr.pnl;
+                tr.pnl = floor;
+            }
+        }
+    }
+
+    /// Cancel queued entries when the report changes; retain risk exits.
+    pub fn install_entry_gate(&mut self, allowed: bool) {
+        self.entries_allowed = allowed;
+        self.pending_targets = None;
+        self.pending_params = None;
+        self.pending_slot = 0.0;
+        if !allowed {
+            for pos in &mut self.positions {
+                if pos.next_action == Some(NextAction::Add) {
+                    pos.next_action = None;
+                }
+            }
+        }
+    }
+
+    /// Free balance: equity minus this bot's posted margins and the real
+    /// account's margin committed elsewhere.
+    pub fn available(&self) -> f64 {
+        self.equity - self.reserved - self.positions.iter().map(|x| x.margin).sum::<f64>()
+    }
+
+    /// Market order at bar t's open spending `budget` USDT on margin + fee, under
+    /// Bybit lot rules, the measured order-book cost for this size, the account's
+    /// taker fee and the real margin tier. Not placed when the symbol has no
     /// rules, the book is too thin, or the account lacks the margin (as Bybit).
     fn open(&mut self, m: &Market, t: usize, sym: usize, side: Side, budget: f64, p: &XsParams) {
-        let (Some(b), Some(r)) = (m.bars[sym][t], m.rules(sym)) else {
+        let (Some(b), Some(r), Some(mark)) = (m.bars[sym][t], m.rules(sym), m.marks[sym][t]) else {
             return;
         };
         if budget <= 0.0 {
@@ -370,9 +542,11 @@ impl XsPortfolio {
         let (buy, leverage, cm) = (side == Side::Long, p.gross_leverage, self.cost_mult);
         // Size so that margin + entry fee == budget (the book cost is not a separate
         // payment: it is already in the worse fill price).
-        let notional = budget / (1.0 / leverage + r.taker_fee * cm);
-        let (Some(cost), Some(exit_cost)) =
-            (r.book_cost(notional, buy), r.book_cost(notional, !buy))
+        let Some(cap) = r.order_notional_cap(b.open) else {
+            return;
+        };
+        let notional = (budget / (1.0 / leverage + r.taker_fee * cm)).min(cap);
+        let (Some(cost), Some(_)) = (r.book_cost(notional, buy), r.book_cost(notional, !buy))
         else {
             return;
         };
@@ -380,7 +554,11 @@ impl XsPortfolio {
         let Some(qty) = r.order_qty(notional / entry, entry) else {
             return;
         };
-        let Some(mmr) = r.mmr(qty * entry) else {
+        if !r.leverage_allowed(qty * entry, leverage) {
+            return;
+        }
+        let Some(liquidation) = r.liquidation_price(side, qty, entry, qty * entry / leverage, cm)
+        else {
             return;
         };
         let fee = qty * entry * r.taker_fee * cm;
@@ -397,15 +575,16 @@ impl XsPortfolio {
             qty,
             margin: qty * entry / leverage,
             leverage,
-            liquidation: entry * (1.0 - side.sign() * (1.0 / leverage - mmr)),
+            liquidation,
             stop: p.stop_pct.map(|s| entry * (1.0 - side.sign() * s / 100.0)),
             fees: fee,
             funding: 0.0,
-            mark: entry,
+            last_funding_ts: None,
+            mark: mark.open,
             next_action: None,
+            action_not_before: 0,
             added: false,
             fee_rate: r.taker_fee,
-            exit_cost,
         });
     }
 
@@ -428,11 +607,19 @@ impl XsPortfolio {
         let Some(q) = r.order_qty(qty0, px) else {
             return;
         };
-        let Some(mmr) = r.mmr((qty0 + q) * px) else {
+        if !r.leverage_allowed((qty0 + q) * px, self.positions[i].leverage) {
+            return;
+        }
+        let entry = (self.positions[i].entry * qty0 + px * q) / (qty0 + q);
+        let margin = self.positions[i].margin + q * px / self.positions[i].leverage;
+        let Some(liquidation) = r.liquidation_price(side, qty0 + q, entry, margin, self.cost_mult)
+        else {
             return;
         };
         let fee = q * px * r.taker_fee * self.cost_mult;
-        if q * px / self.positions[i].leverage + fee > self.available() + 1e-9 {
+        if self.available() < MIN_ENTRY_BALANCE
+            || q * px / self.positions[i].leverage + fee > self.available() + 1e-9
+        {
             return; // Bybit would reject: not enough available balance
         }
         self.equity -= fee;
@@ -443,151 +630,267 @@ impl XsPortfolio {
         pos.margin += q * px / pos.leverage;
         pos.fees += fee;
         pos.added = true;
-        pos.liquidation = pos.entry * (1.0 - s * (1.0 / pos.leverage - mmr));
+        pos.liquidation = liquidation;
         pos.stop = p.stop_pct.map(|st| pos.entry * (1.0 - s * st / 100.0));
     }
 
     pub fn step(&mut self, m: &Market, scores: &[Vec<Option<Score>>], t: usize, p: &XsParams) {
+        if self.execution_error.is_some() {
+            return;
+        }
+        if p.hold == 0
+            || p.top == 0
+            || !p.gross_leverage.is_finite()
+            || p.gross_leverage <= 0.0
+            || !self.cost_mult.is_finite()
+            || self.cost_mult <= 0.0
+        {
+            self.execution_error = Some("invalid strategy parameters or cost multiplier".into());
+            return;
+        }
         let ts = m.ts[t];
-        let rebalancing = self.pending_targets.is_some();
+        // Held positions need actual mark data before any state mutation.
+        if let Some(pos) = self.positions.iter().find(|pos| {
+            m.marks
+                .get(pos.sym)
+                .and_then(|r| r.get(t))
+                .copied()
+                .flatten()
+                .is_none()
+        }) {
+            self.execution_error = Some(format!("{}: missing mark candle at {ts}", pos.symbol));
+            return;
+        }
+        let mut i = 0;
+        while i < self.positions.len() {
+            let sym = self.positions[i].sym;
+            let mark = m.marks[sym][t].expect("prechecked").open;
+            for &(_, rate) in m.funding[sym].iter().filter(|(f, _)| *f == ts) {
+                self.charge_funding(m, i, ts, rate, mark);
+            }
+            if self.execution_error.is_some() {
+                return;
+            }
+            // Gap liquidation precedes every queued discretionary action.
+            if self.positions[i].side.sign() * (mark - self.positions[i].liquidation) <= 0.0 {
+                self.liquidate(i, ts);
+            } else {
+                i += 1;
+            }
+        }
+        let rebalancing = self.pending_targets.is_some() && ts >= self.pending_not_before;
         // 0. Actions decided at the previous close execute at this open. An add
         //    that coincides with a rebalance is skipped: the rebalance decides.
         if std::mem::take(&mut self.flatten_next) {
+            self.pending_targets = None;
             let mut i = 0;
             while i < self.positions.len() {
                 let sym = self.positions[i].sym;
                 match m.bars[sym][t] {
                     Some(b) => {
-                        let px = self.exit_price(m, i, b.open);
-                        self.close(i, ts, px, "Breaker")
+                        if !self.close_market(m, i, ts, b.open, "Breaker") {
+                            return;
+                        }
                     }
-                    None => i += 1,
+                    None => {
+                        self.flatten_next = true;
+                        i += 1;
+                    }
                 }
             }
         }
         let mut i = 0;
         while i < self.positions.len() {
             let sym = self.positions[i].sym;
+            if ts < self.positions[i].action_not_before {
+                i += 1;
+                continue;
+            }
             let action = self.positions[i].next_action.take();
             match (action, m.bars[sym][t]) {
                 (Some(NextAction::Stop), Some(b)) => {
-                    self.close(i, ts, self.exit_price(m, i, b.open), "Stop (close)");
+                    if !self.close_market(m, i, ts, b.open, "Stop (close)") {
+                        return;
+                    }
                     continue;
                 }
                 (Some(NextAction::TakeProfit), Some(b)) => {
-                    self.close(i, ts, self.exit_price(m, i, b.open), "Take profit (close)");
+                    if !self.close_market(m, i, ts, b.open, "Take profit (close)") {
+                        return;
+                    }
                     continue;
                 }
-                (Some(NextAction::Add), Some(_)) if !rebalancing => self.add(m, t, i, p),
+                (Some(NextAction::Rebalance), Some(b)) => {
+                    if !self.close_market(m, i, ts, b.open, "Rebalance") {
+                        return;
+                    }
+                    continue;
+                }
+                (Some(action), None) => self.positions[i].next_action = Some(action),
+                (Some(NextAction::Add), Some(_)) if !rebalancing && self.entries_allowed => {
+                    self.add(m, t, i, p)
+                }
                 _ => {}
             }
             i += 1;
         }
         // 1. Rebalance decided at the previous close, executed at this open.
-        if let Some(target) = self.pending_targets.take() {
-            let mut i = 0;
-            while i < self.positions.len() {
-                let (sym, side) = (self.positions[i].sym, self.positions[i].side);
-                let keep = target.iter().any(|&(s, _, sd)| s == sym && sd == side);
-                match (keep, m.bars[sym][t]) {
-                    (false, Some(b)) => {
-                        let px = self.exit_price(m, i, b.open);
-                        self.close(i, ts, px, "Rebalance");
+        if rebalancing {
+            let execution_data_missing = self.pending_targets.as_ref().is_some_and(|target| {
+                target
+                    .iter()
+                    .any(|(sym, _, _)| m.bars[*sym][t].is_none() || m.marks[*sym][t].is_none())
+            });
+            if execution_data_missing {
+                self.pending_not_before = ts + BAR_MS;
+            } else if let Some(target) = self.pending_targets.take() {
+                let execution = self.pending_params.take().unwrap_or_else(|| p.clone());
+                let p = &execution;
+                // Every position closes so both sides are re-sized to neutral.
+                let mut i = 0;
+                while i < self.positions.len() {
+                    match m.bars[self.positions[i].sym][t] {
+                        Some(b) => {
+                            if !self.close_market(m, i, ts, b.open, "Rebalance") {
+                                return;
+                            }
+                        }
+                        None => {
+                            self.positions[i].next_action = Some(NextAction::Rebalance);
+                            i += 1;
+                        }
                     }
-                    _ => i += 1,
                 }
-            }
-            let marked = self.equity + self.unrealized();
-            let derisk = p
-                .risk
-                .derisk_pct
-                .is_some_and(|d| self.peak > 0.0 && (self.peak - marked) / self.peak * 100.0 >= d);
-            // Each slot's budget (margin + entry fee) is fixed so the base
-            // order AND its possible add both fit in the account: equity / (2 * top)
-            // / (1 + adds).
-            let adds = if p.risk.add_pct.is_some() { 1.0 } else { 0.0 };
-            let base =
-                self.equity / (2 * p.top) as f64 / (1.0 + adds) * if derisk { 0.5 } else { 1.0 };
-            // Volatility weights from bars up to the decision close (t - 1), mean 1.
-            let inv: Vec<Option<f64>> = target
-                .iter()
-                .map(|&(sym, _, _)| {
-                    if p.risk.vol_scaled {
-                        realized_vol(m, sym, t.saturating_sub(1)).map(|v| 1.0 / v)
+                // Each slot's budget (margin + entry fee) was fixed at the decision
+                // so the base order AND its possible add both fit in the account.
+                let base = std::mem::take(&mut self.pending_slot);
+                // Volatility weights from bars up to the decision close (t - 1),
+                // mean 1 within each side so both sides keep equal notional.
+                let inv: Vec<Option<f64>> = target
+                    .iter()
+                    .map(|&(sym, _, _)| {
+                        if p.risk.vol_scaled {
+                            realized_vol(m, sym, t.saturating_sub(1)).map(|v| 1.0 / v)
+                        } else {
+                            Some(1.0)
+                        }
+                    })
+                    .collect();
+                let side_mean = |side: Side| {
+                    let known: Vec<f64> = target
+                        .iter()
+                        .zip(&inv)
+                        .filter(|((_, _, s), _)| *s == side)
+                        .filter_map(|(_, w)| *w)
+                        .collect();
+                    if known.is_empty() {
+                        1.0
                     } else {
-                        Some(1.0)
+                        known.iter().sum::<f64>() / known.len() as f64
                     }
-                })
-                .collect();
-            let known: Vec<f64> = inv.iter().flatten().copied().collect();
-            let mean = if known.is_empty() {
-                1.0
-            } else {
-                known.iter().sum::<f64>() / known.len() as f64
-            };
-            for (k, &(sym, _, side)) in target.iter().enumerate() {
-                if self.positions.iter().any(|x| x.sym == sym) {
-                    continue;
+                };
+                let means = [side_mean(Side::Long), side_mean(Side::Short)];
+                let can_enter = self.entries_allowed
+                    && !self.flatten_next
+                    && self.positions.is_empty()
+                    && !target.is_empty();
+                if can_enter && self.available() < MIN_ENTRY_BALANCE {
+                    self.allocation_note = format!(
+                        "free balance {:.2} USDT below the {MIN_ENTRY_BALANCE} USDT minimum: no entries",
+                        self.available()
+                    );
+                } else if can_enter {
+                    let mut candidate = self.clone();
+                    for (k, &(sym, _, side)) in target.iter().enumerate() {
+                        let mean = means[usize::from(side == Side::Short)];
+                        let w = inv[k].map_or(1.0, |x| x / mean);
+                        candidate.open(m, t, sym, side, base * w, p);
+                    }
+                    let long = candidate
+                        .positions
+                        .iter()
+                        .filter(|p| p.side == Side::Long)
+                        .map(|p| p.qty * p.entry)
+                        .sum::<f64>();
+                    let short = candidate
+                        .positions
+                        .iter()
+                        .filter(|p| p.side == Side::Short)
+                        .map(|p| p.qty * p.entry)
+                        .sum::<f64>();
+                    let gross = long + short;
+                    if candidate.positions.len() == target.len()
+                        && gross > 0.0
+                        && (long - short).abs() / gross <= NEUTRAL_TOLERANCE
+                    {
+                        *self = candidate;
+                    } else {
+                        self.rejected_rebalances += 1;
+                    }
                 }
-                let w = inv[k].map_or(1.0, |x| x / mean);
-                self.open(m, t, sym, side, base * w, p);
+                self.rebalance_equity = self.equity + self.unrealized();
             }
-            self.rebalance_equity = self.equity + self.unrealized();
         }
         // 2. Funding, liquidation and the intrabar stop (worst case first), then
         //    the close-based rules, executed at the next open.
         let mut i = 0;
         while i < self.positions.len() {
             let (sym, side) = (self.positions[i].sym, self.positions[i].side);
+            let mark = m.marks[sym][t].expect("held marks validated at entry");
+            if let Some(&(_, rate)) = m.funding[sym]
+                .iter()
+                .find(|(f, _)| *f > ts && *f < ts + BAR_MS)
+            {
+                // Non-boundary settlement prices cannot be recovered exactly from
+                // 15m candles. Refuse that data rather than use an opening estimate.
+                self.execution_error = Some(format!(
+                    "{}: intrabar funding at {ts} requires finer mark data (rate {rate})",
+                    self.positions[i].symbol
+                ));
+                return;
+            }
             let Some(b) = m.bars[sym][t] else {
                 i += 1;
                 continue;
             };
-            for &(_, rate) in m.funding[sym]
-                .iter()
-                .filter(|(f, _)| *f >= ts && *f < ts + BAR_MS)
-            {
-                let pos = &mut self.positions[i];
-                let cost = side.sign() * rate * pos.qty * b.open;
-                pos.funding += cost;
-                self.equity -= cost;
-            }
             let pos = &self.positions[i];
             let s = side.sign();
             let adverse = if s > 0.0 { b.low } else { b.high };
+            let mark_adverse = if s > 0.0 { mark.low } else { mark.high };
             let through = |level: f64, price: f64| s * (price - level) <= 0.0;
-            let stop_first = pos.stop.is_some_and(|st| s * (st - pos.liquidation) > 0.0);
-            if through(pos.liquidation, b.open)
-                || (through(pos.liquidation, adverse) && !stop_first)
-            {
-                let (liq, margin) = (pos.liquidation, pos.margin);
-                self.liquidations += 1;
-                self.close(i, ts, liq, "Liquidated");
-                if let Some(tr) = self.trades.last_mut() {
-                    let floor = -margin - tr.fees - tr.funding;
-                    if tr.pnl < floor {
-                        self.equity += floor - tr.pnl;
-                        tr.pnl = floor;
-                    }
-                }
+            // Mark liquidation is checked first when both mark liquidation and
+            // traded-price stop occur inside one candle: their ordering is unknown.
+            if through(pos.liquidation, mark.open) || through(pos.liquidation, mark_adverse) {
+                self.liquidate(i, ts);
                 continue;
             }
             if let Some(st) = pos.stop {
                 if through(st, b.open) {
-                    let px = self.exit_price(m, i, b.open);
-                    self.close(i, ts, px, "Stop (gap)");
+                    if !self.close_market(m, i, ts, b.open, "Stop (gap)") {
+                        return;
+                    }
                     continue;
                 }
                 if through(st, adverse) {
-                    let px = self.exit_price(m, i, st);
-                    self.close(i, ts, px, "Stop");
+                    if !self.close_market(m, i, ts, st, "Stop") {
+                        return;
+                    }
                     continue;
                 }
             }
             let r = p.risk;
             let pos = &mut self.positions[i];
-            pos.mark = b.close;
+            pos.mark = mark.close;
             let against = -s * (b.close - pos.entry) / pos.entry * 100.0;
+            let pending_exit = matches!(
+                pos.next_action,
+                Some(NextAction::Stop | NextAction::TakeProfit | NextAction::Rebalance)
+            );
+            if pending_exit {
+                i += 1;
+                continue;
+            }
+            pos.action_not_before = 0;
             pos.next_action = if r.close_stop_pct.is_some_and(|c| against >= c)
                 || (s < 0.0 && r.short_stop_pct.is_some_and(|c| against >= c))
             {
@@ -601,6 +904,32 @@ impl XsPortfolio {
             };
             i += 1;
         }
+        let end = ts + BAR_MS;
+        for i in 0..self.positions.len() {
+            let sym = self.positions[i].sym;
+            // The newest loaded bar's closing settlement is charged when the next
+            // bar (and its real mark open) is processed.
+            if t + 1 == m.ts.len() {
+                break;
+            }
+            for &(_, rate) in m.funding[sym].iter().filter(|(f, _)| *f == end) {
+                let mark =
+                    m.ts.get(t + 1)
+                        .filter(|&&time| time == end)
+                        .and_then(|_| m.marks[sym].get(t + 1))
+                        .copied()
+                        .flatten()
+                        .map(|b| b.open);
+                let Some(mark) = mark else {
+                    self.execution_error = Some(format!(
+                        "{}: funding at end boundary {end} needs its real mark opening price",
+                        self.positions[i].symbol
+                    ));
+                    return;
+                };
+                self.charge_funding(m, i, end, rate, mark);
+            }
+        }
         let marked = self.equity + self.unrealized();
         if let Some(bk) = p.risk.breaker_pct {
             if !self.positions.is_empty()
@@ -611,12 +940,59 @@ impl XsPortfolio {
             }
         }
         // 3. Rebalance decision at aligned closes.
-        if is_rebalance(ts, p.hold) {
-            let target = if self.entries_allowed {
-                targets(m, scores, t, p)
+        self.decide_close(m, scores, t, p);
+        self.peak = self.peak.max(marked);
+        if self.peak > 0.0 {
+            self.max_dd = self.max_dd.max((self.peak - marked) / self.peak * 100.0);
+        }
+    }
+
+    /// Queue a decision using only information available at this close.
+    pub fn decide_close(
+        &mut self,
+        m: &Market,
+        scores: &[Vec<Option<Score>>],
+        t: usize,
+        p: &XsParams,
+    ) {
+        if p.hold > 0 && is_rebalance(m.ts[t], p.hold) {
+            self.pending_not_before = 0;
+            let marked = self.equity + self.unrealized();
+            let usable = marked - self.reserved;
+            let scale =
+                if p.risk.derisk_pct.is_some_and(|d| {
+                    self.peak > 0.0 && (self.peak - marked) / self.peak * 100.0 >= d
+                }) {
+                    0.5
+                } else {
+                    1.0
+                };
+            let (target, top, slot) = if self.entries_allowed {
+                funded_targets(m, scores, t, p, usable, self.cost_mult, scale)
             } else {
-                BTreeMap::new()
+                (BTreeMap::new(), 0, 0.0)
             };
+            self.effective_top = top;
+            self.pending_slot = slot;
+            self.allocation_note = if !self.entries_allowed {
+                "entry gate disabled".into()
+            } else if usable < MIN_ENTRY_BALANCE {
+                format!("free balance {usable:.2} USDT below the {MIN_ENTRY_BALANCE} USDT minimum: no entries")
+            } else if top == 0 {
+                "balance, minimum orders or measured liquidity cannot fund a neutral pair".into()
+            } else if top < p.top {
+                format!(
+                    "balance-adjusted basket: {top} pairs (configured maximum {})",
+                    p.top
+                )
+            } else {
+                format!("{top} funded pairs")
+            };
+            let mut execution = p.clone();
+            if top > 0 {
+                execution.top = top;
+            }
+            self.pending_params = Some(execution);
             self.pending_targets = Some(
                 target
                     .into_iter()
@@ -624,19 +1000,124 @@ impl XsPortfolio {
                     .collect(),
             );
         }
-        self.peak = self.peak.max(marked);
-        if self.peak > 0.0 {
-            self.max_dd = self.max_dd.max((self.peak - marked) / self.peak * 100.0);
+    }
+
+    pub fn executable_targets(
+        &self,
+        m: &Market,
+        scores: &[Vec<Option<Score>>],
+        t: usize,
+        p: &XsParams,
+    ) -> BTreeMap<usize, Side> {
+        if !self.entries_allowed {
+            return BTreeMap::new();
         }
+        funded_targets(
+            m,
+            scores,
+            t,
+            p,
+            self.equity + self.unrealized() - self.reserved,
+            self.cost_mult,
+            1.0,
+        )
+        .0
+    }
+
+    /// Live reports/data received after a candle closes can first fill at a
+    /// future opening boundary. Backtests leave this delay unset.
+    pub fn defer_new_decisions(&mut self, ready_ts: i64) {
+        let earliest = ((ready_ts + BAR_MS - 1) / BAR_MS) * BAR_MS;
+        if self.pending_targets.is_some() && self.pending_not_before == 0 {
+            self.pending_not_before = earliest;
+        }
+        for pos in &mut self.positions {
+            if pos.next_action.is_some() && pos.action_not_before == 0 {
+                pos.action_not_before = earliest;
+            }
+        }
+    }
+
+    pub fn validate_state(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            [
+                self.equity,
+                self.start_equity,
+                self.peak,
+                self.max_dd,
+                self.cost_mult
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+                && self.start_equity > 0.0
+                && self.cost_mult > 0.0,
+            "invalid persisted account values"
+        );
+        anyhow::ensure!(
+            self.execution_error.is_none(),
+            "paper execution failed: {:?}",
+            self.execution_error
+        );
+        let mut symbols = std::collections::HashSet::new();
+        for pos in &self.positions {
+            anyhow::ensure!(
+                symbols.insert(&pos.symbol),
+                "duplicate persisted position {}",
+                pos.symbol
+            );
+            anyhow::ensure!(
+                [
+                    pos.entry,
+                    pos.qty,
+                    pos.margin,
+                    pos.leverage,
+                    pos.liquidation,
+                    pos.fees,
+                    pos.funding,
+                    pos.mark,
+                    pos.fee_rate,
+                ]
+                .iter()
+                .all(|v| v.is_finite())
+                    && pos.entry > 0.0
+                    && pos.qty > 0.0
+                    && pos.margin >= 0.0
+                    && pos.leverage > 0.0
+                    && pos.mark > 0.0
+                    && pos.fees >= 0.0
+                    && pos.fee_rate >= 0.0,
+                "invalid persisted position {}",
+                pos.symbol
+            );
+        }
+        Ok(())
     }
 
     /// Close every position at its last mark (bar close) with its measured
     /// order-book cost and fee.
     pub fn close_all(&mut self, m: &Market, ts: i64, reason: &str) {
+        if self.execution_error.is_some() {
+            return;
+        }
         while !self.positions.is_empty() {
             let i = self.positions.len() - 1;
-            let px = self.exit_price(m, i, self.positions[i].mark);
-            self.close(i, ts, px, reason);
+            let final_bar = m.ts.partition_point(|t| *t + BAR_MS <= ts).checked_sub(1);
+            let reference = final_bar
+                .and_then(|t| m.bars[self.positions[i].sym][t])
+                .map(|b| b.close);
+            let Some(reference) = reference else {
+                self.execution_error = Some("no traded close for final exit".into());
+                return;
+            };
+            if !self.close_market(m, i, ts, reference, reason) {
+                return;
+            }
+        }
+        self.peak = self.peak.max(self.equity);
+        if self.peak > 0.0 {
+            self.max_dd = self
+                .max_dd
+                .max((self.peak - self.equity) / self.peak * 100.0);
         }
     }
 
@@ -647,12 +1128,10 @@ impl XsPortfolio {
             .sum()
     }
 
-    pub fn pending_targets(&self) -> Option<&[(usize, String, Side)]> {
-        self.pending_targets.as_deref()
-    }
-
     pub fn metrics(&self) -> Metrics {
         let mut m = Metrics {
+            execution_error: self.execution_error.clone(),
+            rejected_rebalances: self.rejected_rebalances,
             start_equity: self.start_equity,
             end_equity: self.equity,
             open_unrealized: self.unrealized(),
@@ -668,9 +1147,6 @@ impl XsPortfolio {
             } else {
                 m.gross_loss -= t.pnl
             }
-        }
-        if !self.trades.is_empty() {
-            m.avg_r = self.trades.iter().map(|t| t.r).sum::<f64>() / self.trades.len() as f64;
         }
         m
     }
@@ -779,6 +1255,432 @@ mod tests {
     }
 
     #[test]
+    fn mark_gap_liquidates_before_queued_stop() {
+        let mut m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.positions[0].next_action = Some(NextAction::Stop);
+        m.marks[0][101] = Some(super::super::Bar {
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0.0,
+            turnover: 0.0,
+        });
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!(pf.positions.is_empty());
+        assert_eq!(pf.trades[0].reason, "Liquidated");
+        assert_eq!(pf.metrics().liquidations, 1);
+    }
+
+    #[test]
+    fn funding_uses_mark_and_debits_isolated_margin() {
+        let mut m = flat_with(&[]);
+        let r = m.rules[0].as_mut().unwrap();
+        r.taker_fee = 0.0;
+        for b in &mut r.book {
+            b.1 = 0.0;
+            b.2 = 0.0;
+        }
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 1000.0, &p);
+        let (qty, margin, liq) = (
+            pf.positions[0].qty,
+            pf.positions[0].margin,
+            pf.positions[0].liquidation,
+        );
+        let mark = m.marks[0][101].as_mut().unwrap();
+        mark.open = 110.0;
+        mark.high = 110.0;
+        m.funding[0] = vec![(101 * BAR_MS, 0.1)];
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        let cost = qty * 110.0 * 0.1;
+        assert!((pf.positions[0].funding - cost).abs() < 1e-9);
+        assert!((pf.positions[0].margin - (margin - cost)).abs() < 1e-9);
+        assert!(pf.positions[0].liquidation > liq);
+        assert!((pf.available()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mark_data_is_required_and_intrabar_funding_is_rejected() {
+        let mut m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        let cash = pf.equity;
+        m.marks[0][101] = None;
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!(pf
+            .execution_error
+            .as_ref()
+            .unwrap()
+            .contains("missing mark"));
+        assert_eq!(pf.equity, cash);
+        m.marks[0][101] = m.marks[0][100];
+        m.funding[0] = vec![(101 * BAR_MS + 1, 0.01)];
+        pf.execution_error = None;
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!(pf
+            .execution_error
+            .as_ref()
+            .unwrap()
+            .contains("intrabar funding"));
+    }
+
+    fn pending_pair(pf: &mut XsPortfolio, p: &XsParams) {
+        pf.pending_targets = Some(vec![
+            (0, "S0USDT".into(), Side::Long),
+            (1, "S1USDT".into(), Side::Short),
+        ]);
+        pf.pending_params = Some(p.clone());
+        pf.pending_slot = pf.equity * SLOT_HEADROOM / 2.0;
+    }
+
+    #[test]
+    fn paired_entries_wait_for_missing_candle_and_use_captured_parameters() {
+        let mut m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pending_pair(&mut pf, &p);
+        m.bars[1][101] = None;
+        pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
+        assert!(pf.positions.is_empty());
+        assert!(pf.pending_targets.is_some());
+        let mut later = p.clone();
+        later.gross_leverage = 10.0;
+        pf.step(&m, &vec![vec![None; 200]; 2], 102, &later);
+        assert_eq!(pf.positions.len(), 2);
+        assert!(pf.positions.iter().all(|x| x.leverage == p.gross_leverage));
+    }
+
+    #[test]
+    fn disabled_gate_and_report_delay_prevent_stale_entries() {
+        let m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pending_pair(&mut pf, &p);
+        pf.install_entry_gate(false);
+        pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
+        assert!(pf.positions.is_empty());
+        pf.install_entry_gate(true);
+        pending_pair(&mut pf, &p);
+        pf.defer_new_decisions(101 * BAR_MS + 1);
+        pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
+        assert!(pf.positions.is_empty());
+        pf.step(&m, &vec![vec![None; 200]; 2], 102, &p);
+        assert_eq!(pf.positions.len(), 2);
+    }
+
+    #[test]
+    fn incomplete_pair_does_not_leave_one_sided_orders_or_fees() {
+        let mut m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        let p = risk_params(Risk::default());
+        m.rules[1].as_mut().unwrap().min_qty = 1000.0;
+        let mut pf = XsPortfolio::new(1000.0);
+        pending_pair(&mut pf, &p);
+        pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
+        assert!(pf.positions.is_empty());
+        assert_eq!(pf.equity, 1000.0);
+        assert_eq!(pf.rejected_rebalances, 1);
+    }
+
+    #[test]
+    fn thin_book_exit_is_invalid_instead_of_negative_fill() {
+        let mut m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        m.rules[0].as_mut().unwrap().book = vec![(1.0, 0.5, 0.5)];
+        pf.close_all(&m, 101 * BAR_MS, "End of test");
+        assert!(pf.execution_error.is_some());
+        assert_eq!(pf.positions.len(), 1);
+        assert!(pf.trades.is_empty());
+    }
+
+    #[test]
+    fn final_exit_uses_traded_close_and_never_future_data() {
+        let mut m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.positions[0].mark = 200.0;
+        for b in m.bars[0][101..].iter_mut().flatten() {
+            b.close = 500.0;
+            b.high = 500.0;
+        }
+        pf.close_all(&m, 101 * BAR_MS, "End of test");
+        assert!(pf.trades[0].exit < 100.0 && pf.trades[0].exit > 99.0);
+    }
+
+    #[test]
+    fn allocation_adapts_to_small_and_large_balances() {
+        let series: Vec<Vec<f64>> = (0..12)
+            .map(|s| {
+                (0..200)
+                    .map(|t| 100.0 + (s as f64 - 5.5) * t as f64 * 0.0001)
+                    .collect()
+            })
+            .collect();
+        let mut m = market(&series);
+        for r in m.rules.iter_mut().flatten() {
+            r.qty_step = 0.001;
+            r.min_qty = 0.001;
+        }
+        let scores = sc(&m);
+        let p = XsParams {
+            signal: Signal::Return,
+            flip: false,
+            lookback: 16,
+            hold: 16,
+            top: 5,
+            gross_leverage: 2.0,
+            stop_pct: None,
+            risk: Risk::default(),
+        };
+        for equity in [0.1, 1.0, 10.0, 100.0, 1000.0, 1_000_000.0] {
+            let mut pf = XsPortfolio::new(equity);
+            pf.decide_close(&m, &scores, 175, &p);
+            pf.step(&m, &scores, 176, &p);
+            assert!(
+                pf.execution_error.is_none(),
+                "balance {equity}: {:?}",
+                pf.execution_error
+            );
+            if equity < 5.01 {
+                assert!(pf.positions.is_empty());
+                assert_eq!(pf.effective_top, 0);
+            } else {
+                assert!(
+                    !pf.positions.is_empty(),
+                    "balance {equity}: {}",
+                    pf.allocation_note
+                );
+            }
+            assert!(pf.available() >= -1e-8);
+            assert!(pf.positions.len() <= 2 * p.top);
+            for pos in &pf.positions {
+                assert!(pos.qty * pos.entry >= 5.0);
+                assert!(pos.qty * pos.entry <= 3200.0 + 1e-8);
+            }
+            if equity == 10.0 {
+                assert!(pf.effective_top < p.top);
+            }
+        }
+    }
+
+    #[test]
+    fn no_entries_or_adds_below_the_free_balance_floor() {
+        let series: Vec<Vec<f64>> = (0..12)
+            .map(|s| {
+                (0..200)
+                    .map(|t| 100.0 + (s as f64 - 5.5) * t as f64 * 0.0001)
+                    .collect()
+            })
+            .collect();
+        let m = market(&series);
+        let scores = sc(&m);
+        let p = XsParams {
+            signal: Signal::Return,
+            flip: false,
+            lookback: 16,
+            hold: 16,
+            top: 1,
+            gross_leverage: 1.0,
+            stop_pct: None,
+            risk: Risk::default(),
+        };
+        // 100 USDT wallet, 96 committed to other positions: 4 free, no trade.
+        let mut pf = XsPortfolio::new(100.0);
+        pf.reserved = 96.0;
+        pf.decide_close(&m, &scores, 175, &p);
+        assert_eq!(pf.effective_top, 0);
+        assert!(
+            pf.allocation_note.contains("below the 5 USDT minimum"),
+            "{}",
+            pf.allocation_note
+        );
+        pf.step(&m, &scores, 176, &p);
+        assert!(pf.positions.is_empty());
+        // 20 free: one neutral pair opens, sized from the free balance only.
+        let mut pf = XsPortfolio::new(100.0);
+        pf.reserved = 80.0;
+        pf.decide_close(&m, &scores, 175, &p);
+        pf.step(&m, &scores, 176, &p);
+        assert_eq!(pf.positions.len(), 2);
+        let posted: f64 = pf.positions.iter().map(|x| x.margin + x.fees).sum();
+        assert!(posted <= 20.0 + 1e-9, "{posted}");
+        // An add is refused once the free balance is under the floor.
+        let a = flat_with(&[]);
+        let rp = risk_params(Risk {
+            add_pct: Some(1.0),
+            ..Default::default()
+        });
+        let mut pf = XsPortfolio::new(100.0);
+        pf.open(&a, 100, 0, Side::Long, 96.0, &rp);
+        let qty = pf.positions[0].qty;
+        pf.add(&a, 101, 0, &rp);
+        assert_eq!(pf.positions[0].qty, qty, "4 USDT free: add refused");
+    }
+
+    #[test]
+    fn coarse_lot_steps_are_left_out_instead_of_unbalancing_the_basket() {
+        let series: Vec<Vec<f64>> = (0..12)
+            .map(|s| {
+                (0..200)
+                    .map(|t| 100.0 + (s as f64 - 5.5) * t as f64 * 0.0001)
+                    .collect()
+            })
+            .collect();
+        let mut m = market(&series);
+        // Symbol 0 (a long candidate) trades in steps of 0.5 (~50 USDT): a 75
+        // USDT slot would round down to 50 and unbalance the basket.
+        if let Some(r) = m.rules[0].as_mut() {
+            r.qty_step = 0.5;
+            r.min_qty = 0.5;
+        }
+        let scores = sc(&m);
+        let p = XsParams {
+            signal: Signal::Return,
+            flip: false,
+            lookback: 16,
+            hold: 16,
+            top: 2,
+            gross_leverage: 1.0,
+            stop_pct: None,
+            risk: Risk::default(),
+        };
+        let mut pf = XsPortfolio::new(300.0);
+        pf.decide_close(&m, &scores, 175, &p);
+        pf.step(&m, &scores, 176, &p);
+        assert_eq!(pf.rejected_rebalances, 0);
+        assert_eq!(pf.positions.len(), 4);
+        assert!(pf.positions.iter().all(|x| x.sym != 0));
+        let side = |s: Side| -> f64 {
+            pf.positions
+                .iter()
+                .filter(|x| x.side == s)
+                .map(|x| x.qty * x.entry)
+                .sum()
+        };
+        let (l, sh) = (side(Side::Long), side(Side::Short));
+        assert!((l - sh).abs() / (l + sh) <= NEUTRAL_TOLERANCE);
+    }
+
+    #[test]
+    fn settlement_at_the_newest_close_waits_for_the_next_bar() {
+        let mut m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        // A settlement stamped at the close of the last loaded bar.
+        m.funding[0] = vec![(200 * BAR_MS, 0.001)];
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 199, 0, Side::Long, 200.0, &p);
+        pf.step(&m, &[vec![None; 200]], 199, &p);
+        assert!(pf.execution_error.is_none(), "{:?}", pf.execution_error);
+        assert_eq!(pf.positions[0].funding, 0.0);
+        // Once that bar exists, the settlement is charged at its mark open.
+        let mut next = flat_with(&[]);
+        next.ts = (1..201).map(|i| i * BAR_MS).collect();
+        next.funding[0] = m.funding[0].clone();
+        pf.step(&next, &[vec![None; 200]], 199, &p);
+        assert!(pf.execution_error.is_none());
+        let pos = &pf.positions[0];
+        assert!((pos.funding - 0.001 * pos.qty * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boundary_funding_is_paid_by_outgoing_holdings() {
+        let mut m = flat_with(&[]);
+        m.funding[0] = vec![(101 * BAR_MS, 0.01)];
+        let sc = vec![vec![None; 200]];
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        let qty = pf.positions[0].qty;
+        pf.pending_targets = Some(vec![(0, "AUSDT".into(), Side::Short)]);
+        pf.step(&m, &sc, 101, &p);
+        assert!((pf.trades[0].funding - qty).abs() < 1e-9);
+        assert!(
+            pf.positions.is_empty(),
+            "unpaired replacement must be rejected"
+        );
+        assert_eq!(pf.rejected_rebalances, 1);
+        pf.open(&m, 101, 0, Side::Short, 200.0, &p);
+        assert_eq!(pf.positions[0].funding, 0.0);
+    }
+
+    #[test]
+    fn missing_candle_does_not_erase_funding() {
+        let mut m = flat_with(&[]);
+        m.bars[0][101] = None;
+        m.funding[0] = vec![(101 * BAR_MS, 0.01)];
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        let qty = pf.positions[0].qty;
+        let mark = pf.positions[0].mark;
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!((pf.positions[0].funding - 0.01 * qty * mark).abs() < 1e-9);
+    }
+
+    #[test]
+    fn queued_exits_survive_missing_candles() {
+        for action in [
+            NextAction::Stop,
+            NextAction::TakeProfit,
+            NextAction::Rebalance,
+        ] {
+            let mut m = flat_with(&[]);
+            m.bars[0][101] = None;
+            let sc = vec![vec![None; 200]];
+            let p = risk_params(Risk::default());
+            let mut pf = XsPortfolio::new(1000.0);
+            pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+            pf.positions[0].next_action = Some(action);
+            pf.step(&m, &sc, 101, &p);
+            assert_eq!(pf.positions[0].next_action, Some(action));
+            pf.step(&m, &sc, 102, &p);
+            assert!(pf.positions.is_empty());
+            assert_eq!(pf.trades[0].exit_ts, 102 * BAR_MS);
+        }
+    }
+
+    #[test]
+    fn breaker_and_rebalance_exits_survive_missing_candles() {
+        for breaker in [false, true] {
+            let mut m = flat_with(&[]);
+            m.bars[0][101] = None;
+            let sc = vec![vec![None; 200]];
+            let p = risk_params(Risk::default());
+            let mut pf = XsPortfolio::new(1000.0);
+            pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+            if breaker {
+                pf.flatten_next = true;
+            } else {
+                pf.pending_targets = Some(vec![]);
+            }
+            pf.step(&m, &sc, 101, &p);
+            pf.step(&m, &sc, 102, &p);
+            assert!(pf.positions.is_empty());
+        }
+    }
+
+    #[test]
+    fn final_closing_costs_are_in_drawdown() {
+        let m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.step(&m, &[vec![None; 200]], 100, &p);
+        let before = pf.metrics().max_drawdown_pct;
+        pf.close_all(&m, 101 * BAR_MS, "End of test");
+        assert!(pf.metrics().max_drawdown_pct > before);
+        assert!((pf.metrics().max_drawdown_pct - (1000.0 - pf.equity) / 10.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn longs_losers_and_shorts_winners() {
         let mk = |drift: f64| {
             (0..200)
@@ -873,7 +1775,9 @@ mod tests {
     }
 
     /// One symbol, flat at 100, with chosen (open, high, low, close) bars.
-    fn flat_with(changes: &[(usize, (f64, f64, f64, f64))]) -> Market {
+    type Ohlc = (f64, f64, f64, f64);
+
+    fn flat_with(changes: &[(usize, Ohlc)]) -> Market {
         let mut bars: Vec<Option<crate::engine::Bar>> = (0..200)
             .map(|_| {
                 Some(crate::engine::Bar {
@@ -897,12 +1801,14 @@ mod tests {
             });
         }
         Market {
+            marks: vec![bars.clone()],
+            listing_times: Vec::new(),
+            entry_eligible: Vec::new(),
             ts: (0..200).map(|i| i * BAR_MS).collect(),
             symbols: vec!["AUSDT".into()],
             bars: vec![bars],
             funding: vec![vec![]],
             rules: vec![Some(crate::engine::rules::Rules::test_liquid()); 3],
-            ..Default::default()
         }
     }
 
@@ -1256,7 +2162,7 @@ mod tests {
 
     /// Live: a new listing shifts symbol indices; positions must follow by name.
     #[test]
-    fn reindex_follows_symbol_names_and_settles_delisted() {
+    fn reindex_follows_names_and_refuses_invented_delisting_fills() {
         let m = market(&wavy(200));
         let s = sc(&m);
         let p = XsParams {
@@ -1274,16 +2180,16 @@ mod tests {
         let mut pf = pf0.clone();
         let mut shifted = vec!["AAANEWUSDT".to_string()];
         shifted.extend(m.symbols.iter().cloned());
-        pf.reindex(&shifted, m.ts[199]);
+        pf.reindex(&shifted);
         for x in &pf.positions {
             assert_eq!(shifted[x.sym], x.symbol);
         }
         let gone = pf0.positions[0].symbol.clone();
         let mut pf = pf0.clone();
         let fewer: Vec<String> = m.symbols.iter().filter(|x| **x != gone).cloned().collect();
-        pf.reindex(&fewer, m.ts[199]);
-        assert_eq!(pf.positions.len(), 3);
-        assert_eq!(pf.trades.last().unwrap().reason, "Delisted");
-        assert_eq!(pf.trades.last().unwrap().symbol, gone);
+        pf.reindex(&fewer);
+        assert_eq!(pf.positions.len(), 4);
+        assert!(pf.execution_error.as_ref().unwrap().contains(&gone));
+        assert_eq!(pf.trades.len(), pf0.trades.len());
     }
 }

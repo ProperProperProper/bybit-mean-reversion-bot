@@ -1,95 +1,37 @@
 # Bybit Mean Reversion Bot
 
-An **open-source crypto trading bot in Rust** for **Bybit USDT perpetual futures**. It runs a **market-neutral, cross-sectional mean-reversion strategy**, and it was selected only after **walk-forward backtesting** on real exchange data with **no lookahead and no repainting**. It includes a live **paper-trading** service with a web console.
+A Rust paper-trading and research service for Bybit USDT perpetuals. It reads real exchange data: closed traded and mark-price candles, settled funding, instrument filters, margin tiers, this account's fees and wallet, and current order books. **It never places orders.**
 
-**Paper trading and signals only. It never places orders.**
+**Status (2 October 2026):** every accounting, data and recovery defect found so far is fixed, with regression tests ([audit](docs/audit.md)). With those fixes, the live strategy **fails** its walk-forward on all four real 14-day data sets, and no other signal family holds up either ([validation](docs/validation.md)). The paper account therefore stays flat until a strategy passes.
 
-Topics: algorithmic trading · quant strategy · crypto futures · perpetual swaps · backtesting · walk-forward optimisation · statistical arbitrage · long/short · Rust
+## Strategy
 
-## The strategy
+- **Universe:** the top 50 token USDT perpetuals on Bybit by 24-hour turnover; stock, ETF, forex and commodity contracts, delistings and pre-listings are excluded.
+- **Signal (live family):** contrarian Pulse. Long the most bearish, short the most bullish, equal notional per leg, market-neutral within 2%.
+- **Settings:** chosen every bar by a 14-day walk-forward from 48 combinations: either direction, 5 or 10 pairs, 4/8/24-hour rebalances, 1× or 2× leverage, no stop or a 20% stop.
+- **Balance-aware sizing:** pairs are funded from the free balance, i.e. the wallet minus margin committed anywhere on the account (other positions, orders, locks). Smaller balances use fewer pairs; a contract whose lot step would unbalance the basket is left out at that size. Below **5 USDT free, nothing is opened or added**; exits continue.
+- **Execution model:** decided at a 15-minute close, filled at the next open at the measured order-book cost, with this account's taker fee, Bybit lot rounding and tier leverage limits. A rebalance fills all legs or none. Funding is valued at the mark price and drawn from free cash, then isolated margin. Liquidation triggers on mark-price extremes, using real tiers and deductions.
 
-On every 15-minute close, the bot scores the **top 100 Bybit USDT perpetuals by 24h turnover** with a screener built from closed bars. The screener measures volatility, price action, volume, an activity rank, a trend score and **Pulse**: volume surge × volatility expansion × short-term direction.
+## Validation gate
 
-- **Contrarian Pulse.** The bot goes **long the 5 coins with the most bearish Pulse** and **short the 5 with the most bullish**, with equal size on each side, so it is market-neutral. It then rebalances on a fixed UTC schedule. Extreme moves on these coins tend to snap back; the strategy trades that snap-back.
-- **Settings re-chosen every bar.** A 14-day walk-forward re-picks the settings (holding time, number of coins, leverage up to 2x, stop) on every bar. New positions open only while it passes.
-- **Sized from the real account balance** (read-only), including deposits and withdrawals.
-- **Drawdown handling is tested, not guessed.** Nine rules were compared (see *Results*); none improved on "no rule".
-
-## Real trading conditions in every backtest
-
-Backtests use Bybit's own data and rules, never assumed numbers:
-
-- **Closed 15m bars only.** Decisions are made on a bar's close and filled at the next open; stops and liquidations are checked inside the bar, worst case first. Tests prove that no decision changes when future bars change.
-- **Order-book slippage.** Every order walks Bybit's real order book (500 levels) for its exact size. Bybit publishes no historical order books, so backtests use the latest measurement, which the live service refreshes hourly.
-- **Fees** are your account's own taker fee per coin (read-only `/v5/account/fee-rate`).
-- **Margin** uses Bybit's real maintenance-margin tiers per coin, with isolated-margin liquidation.
-- **Funding** uses real settled funding rates.
-- **Order rules:** Bybit's lot rules (qty step, minimum qty, minimum order value). A coin without rules isn't traded, and an order the account can't fund is rejected, as on Bybit.
-- **Universe:** only coins trading today, never delisted ones.
-
-## How it was tested
-
-Every test uses exactly **14 days** of data.
-
-- **Walk-forward (also run live, on every bar):** choose settings on 8 days, trade the next 2 unseen days, three times within the 14 days. It shows **PASSED** only if all of these hold:
-  - no liquidations
-  - profit factor above 1.2 and net profit positive
-  - the net *stays* positive without the single best window
-  - the final settings survive the 14 days with drawdown at or below 25%
-
-  If only the profit-factor or best-window check fails, it shows **FORWARD TEST** and paper keeps trading, labelled as not validated. Otherwise it shows **FAILED** and opens nothing new.
-- **Strategy selection (`examples/research.rs`):** seven candidate signals ran the walk-forward on three separate 14-day windows (Aug 20 – Oct 1, 2026). Then came two 14-day forward tests, where settings chosen on one window traded the next window, unseen. A single lucky 14-day period can't select a strategy.
-
-## Results
-
-These results use real Bybit data and rules, starting from a **109.48 USDT** account.
-
-**Contrarian Pulse was the only signal positive in all five out-of-sample checks:**
-
-| Check | Result |
-|---|---|
-| Walk-forward, unseen days (3 windows) | +12.6% / +12.9% / +4.5% |
-| 14-day forward test 1 (Sep 3–17) | **+40.6%** (+25.5% at 2x costs), max drawdown 28.0% |
-| 14-day forward test 2 (Sep 17–Oct 1) | **+28.3%** (+23.3% at 2x costs), max drawdown 21.3% |
-| Liquidations | 0 |
-
-The other signals all lost somewhere: return reversal and momentum, trend score, price action, volatility, RSI and funding carry. The edge is real but thin and lumpy: profit factor is about 1.2–1.35, and gains often come from a few days.
-
-**Drawdown rules** (`examples/risk_variants.rs`) were tested one at a time on the same five checks:
-
-| Rule | Outcome |
-|---|---|
-| **No rule (live)** | Positive in all five, also at 2x costs |
-| Add once at 10% against (fully funded) | Drawdown halved to about 14%, but lost at 2x costs in one forward test |
-| Close-based stops (10%, 15%), short-only squeeze stop, take-profit 10% | Lost money or cut returns. They exit the extreme coins right before the snap-back |
-| Portfolio breaker, volatility-scaled sizing, half size after a 10% drawdown | Mixed: worse in at least one check |
-| 1x leverage | Roughly half the drawdown (11–15%) and half the return |
-
-Nothing here is financial advice. Past results do not predict future ones.
+1,344 closed bars: three rounds of 8 days in-sample and 2 days out-of-sample, then final settings chosen on the latest 8 days. `PASSED` needs a profitable out-of-sample result with profit factor > 1.2, no liquidations, profit without the best window, at least 8 trades, and final settings profitable within a 25% drawdown over the 14 days. `FORWARD TEST` (paper may trade) relaxes only the profit-factor and best-window gates. Otherwise paper opens nothing.
 
 ## Run
 
 ```sh
-cargo run --release --bin bot -- serve                  # paper service + console, http://127.0.0.1:8787
-cargo run --release --bin bot -- backtest               # the live strategy's 14-day walk-forward now
-cargo run --release --example fetch_research_data       # three 14-day research windows + Bybit rules
-cargo run --release --example research                  # signal research
-cargo run --release --example risk_variants             # drawdown rules compared
-cargo test --release
+./deploy.sh                                   # build, test, install, (re)start the launchd service
+cargo run --release --bin bot -- backtest     # one live-equivalent walk-forward (needs credentials)
+cargo run --release --example fetch_research_data
+EQ=<balance> cargo run --release --example research
+cargo run --release --example validate_cached -- SNAPSHOT_DIR <balance> out.json
+cargo test --release --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
-The bot reads your balance and fee rates **read-only**, with Bybit API credentials stored in the macOS Keychain (`security` generic password, service `unified-combo-grid`, account `live`, JSON `{"api_key","api_secret"}`). Credentials are never written to files.
+The console is at `http://127.0.0.1:8787`. Runtime data lives in `~/Library/Application Support/BybitMeanReversionBot`, outside `~/Documents`, which macOS blocks for launchd jobs. Run research tools on `sqlite3 ".backup"` copies, never on the live files.
 
-`deploy.sh` builds and tests the bot, installs it to `~/Library/Application Support/BybitMeanReversionBot`, and runs it under launchd on macOS. It keeps running and restarts on errors, panics and hangs, with CPU capped at 85%.
+Credentials come from the macOS Keychain generic password `unified-combo-grid` / `live` (`api_key`, `api_secret`) and are used only for signed read-only GETs. `deploy.sh` re-signs the installed binary with a fixed identifier so the LuLu firewall rule keeps matching after rebuilds.
 
-## Code map
+## Documentation
 
-| Path | What it is |
-|---|---|
-| `src/engine/data.rs` | Bybit REST client (bars, funding, instruments, risk limits, order books, fee rates, balance) and the SQLite cache |
-| `src/engine/rules.rs` | Per-coin trading rules and the order-book cost model |
-| `src/engine/scores.rs` | The screener (causal, closed bars) |
-| `src/engine/xs.rs` | Strategy engine: ranking, positions, costs, margin, liquidation, drawdown rules, daily P&L |
-| `src/engine/walkforward.rs` | 14-day walk-forward gate and the strategy grids |
-| `src/bin/bot/` | The paper-trading service and web console |
-| `examples/` | Research tools (the results above) |
+One page per source file in [docs/](docs/README.md), plus the [audit](docs/audit.md) and [validation](docs/validation.md) reports.

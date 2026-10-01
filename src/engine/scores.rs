@@ -193,11 +193,42 @@ fn percentile(sorted: &[f64], x: f64) -> f64 {
 
 /// Scores `[symbol][bar]`, None outside the universe or during warmup.
 pub fn compute(m: &Market, universe: usize) -> Vec<Vec<Option<Score>>> {
-    let raws: Vec<Vec<Option<Raw>>> = m.bars.iter().map(|b| raw_features(b)).collect();
-    let mut out = vec![vec![None; m.len()]; m.symbols.len()];
-    for t in 0..m.len() {
+    let raws: Vec<Vec<Option<Raw>>> = m
+        .bars
+        .iter()
+        .enumerate()
+        .map(|(s, bars)| {
+            if let Some(launch) = m.listing_times.get(s).copied().flatten() {
+                let first_full = ((launch + crate::engine::BAR_MS - 1) / crate::engine::BAR_MS)
+                    * crate::engine::BAR_MS;
+                let eligible: Vec<Option<Bar>> = bars
+                    .iter()
+                    .zip(&m.ts)
+                    .map(|(bar, ts)| if *ts < first_full { None } else { *bar })
+                    .collect();
+                raw_features(&eligible)
+            } else {
+                raw_features(bars)
+            }
+        })
+        .collect();
+    let mut out = vec![vec![None; m.ts.len()]; m.symbols.len()];
+    for t in 0..m.ts.len() {
         let mut members: Vec<(usize, Raw)> = (0..m.symbols.len())
-            .filter_map(|s| raws[s][t].map(|r| (s, r)))
+            .filter_map(|s| {
+                if !m.entry_eligible.get(s).copied().unwrap_or(true) {
+                    return None;
+                }
+                m.rules(s)?;
+                if let Some(launch) = m.listing_times.get(s).copied().flatten() {
+                    let first_full = ((launch + crate::engine::BAR_MS - 1) / crate::engine::BAR_MS)
+                        * crate::engine::BAR_MS;
+                    if m.ts[t] < first_full + (WARMUP as i64 - 1) * crate::engine::BAR_MS {
+                        return None;
+                    }
+                }
+                raws[s][t].map(|r| (s, r))
+            })
             .collect();
         members.sort_by(|a, b| b.1.turnover_24h.total_cmp(&a.1.turnover_24h));
         members.truncate(universe);
@@ -257,9 +288,22 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::BAR_MS;
 
+    #[test]
+    fn listing_time_excludes_prelisting_history_and_requires_warmup() {
+        let series: Vec<f64> = (0..250).map(|i| 100.0 + (i as f64 * 0.1).sin()).collect();
+        let mut m = market(&[series.clone(), series]);
+        m.listing_times = vec![Some(100 * BAR_MS + 1); 2];
+        let sc = compute(&m, 100);
+        assert!(sc[0][..210].iter().all(Option::is_none));
+        assert!(sc[0][210].is_some());
+    }
+
     pub fn market(series: &[Vec<f64>]) -> Market {
         let n = series[0].len();
-        Market {
+        let mut m = Market {
+            marks: Vec::new(),
+            listing_times: Vec::new(),
+            entry_eligible: Vec::new(),
             ts: (0..n as i64).map(|i| i * BAR_MS).collect(),
             symbols: (0..series.len()).map(|i| format!("S{i}USDT")).collect(),
             bars: series
@@ -284,7 +328,9 @@ pub(crate) mod tests {
                 .collect(),
             funding: vec![vec![]; series.len()],
             rules: vec![Some(crate::engine::rules::Rules::test_liquid()); series.len()],
-        }
+        };
+        m.marks = m.bars.clone();
+        m
     }
 
     #[test]

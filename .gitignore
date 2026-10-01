@@ -1,0 +1,14 @@
+/target/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+*.log
+.DS_Store
+/data/
+/.claude/

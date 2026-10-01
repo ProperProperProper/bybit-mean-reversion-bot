@@ -38,10 +38,12 @@ pub fn load_window(dir: &Path, k: i64) -> Result<Market> {
     cache.market(&symbols, window_bounds(k).1)
 }
 
-/// The real account's USDT wallet balance (read-only, Keychain credentials).
+/// The real account's free USDT: wallet minus margin committed to positions,
+/// orders and locks (read-only, Keychain credentials).
 pub async fn real_balance() -> Result<f64> {
     let creds = keychain::load()?;
-    Client::new()?.usdt_wallet_balance(&creds).await
+    let account = Client::new()?.usdt_account(&creds).await?;
+    Ok(account.wallet - account.reserved())
 }
 
 /// Start equity for research: EQ=... if set (to study another size explicitly),

@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let creds = keychain::load()?;
     println!(
         "account USDT wallet balance: {:.2}",
-        client.usdt_wallet_balance(&creds).await?
+        client.usdt_account(&creds).await?.wallet
     );
     let lots = client.usdt_perpetual_lots().await?;
     let lots = client

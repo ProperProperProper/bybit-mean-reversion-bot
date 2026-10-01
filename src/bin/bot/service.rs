@@ -297,8 +297,12 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
     // without them (the service stops and launchd retries).
     let creds = keychain::load()?;
     let client = data::Client::new()?;
-    let balance = client.usdt_wallet_balance(&creds).await?;
-    info!("real account USDT wallet balance {balance:.2}");
+    let account = client.usdt_account(&creds).await?;
+    let balance = account.wallet;
+    info!(
+        "real account USDT wallet balance {balance:.2} ({:.2} committed elsewhere)",
+        account.reserved()
+    );
     let app = Arc::new(App {
         creds,
         rules_at: std::sync::Mutex::new(None),
@@ -318,7 +322,8 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
     });
 
     let a = app.clone();
-    tokio::task::spawn_blocking(move || match forward_test_daily(&a.dir, balance) {
+    let free = balance - account.reserved();
+    tokio::task::spawn_blocking(move || match forward_test_daily(&a.dir, free) {
         Ok(v) => *a.research.write().unwrap_or_else(|e| e.into_inner()) = Some(v),
         Err(e) => {
             warn!("forward test chart unavailable: {e:#}");

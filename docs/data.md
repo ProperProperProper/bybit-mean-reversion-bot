@@ -31,7 +31,7 @@ An HTTP client (5 s connect timeout, 15 s total) with a shared pacing lock.
 | `risk_limits` | Every symbol's maintenance-margin tiers, deductions derived as above. |
 | `orderbook(symbol)` | 500 levels per side, best first, and the book timestamp. |
 | `taker_fees(creds)` | This account's taker fee per linear symbol (signed). |
-| `usdt_account(creds)` / `usdt_wallet_balance(creds)` | The `AccountBalance` / just its wallet (signed). |
+| `usdt_account(creds)` | The `AccountBalance` (signed). |
 | `fetch_rules(creds, lots)` | Complete `Rules` for every symbol with a lot filter, fee, tiers and a measurable book. **Fails if fewer than half the symbols measure**, so an outage can't replace the stored snapshot with an empty one. |
 | `klines_since` / `klines_range` / `mark_range` | Closed 15m traded or mark-price candles, oldest first, paged backwards 1,000 at a time. The forming bar is never included; an invalid OHLC row fails the call. |
 | `funding_since` / `funding_range` | Settled funding, paged by 200; a malformed record fails the call. |

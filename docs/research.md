@@ -16,7 +16,7 @@ The three fixed, back-to-back 14-day windows of real Bybit data used for strateg
 | `window_bounds(k)` | Open times of window `k`'s first and last bar (exactly 1,344 bars) |
 | `window_file(dir, k)` | `dir/window_k.db` |
 | `load_window(dir, k)` | Window `k` as a `Market` with every stored symbol and its Bybit rules; an error if the file is missing |
-| `real_balance()` | The real account's USDT wallet balance (Keychain credentials, read-only) |
+| `real_balance()` | The real account's free USDT: wallet minus margin committed elsewhere (Keychain credentials, read-only) |
 | `start_equity()` | Research start equity: `EQ=…` if set (to study another size explicitly), otherwise the real balance. There is no built-in default. |
 
 **Why three windows:** one 14-day test can't tell an edge from luck. A strategy is only kept if it holds up in all three windows and in both 14-day forward tests (settings chosen on one window, traded on the next). Each test is still exactly 14 days.

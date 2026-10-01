@@ -251,11 +251,6 @@ impl Client {
             .collect())
     }
 
-    /// The real account's USDT wallet balance (Unified account; read-only).
-    pub async fn usdt_wallet_balance(&self, creds: &Credentials) -> Result<f64> {
-        Ok(self.usdt_account(creds).await?.wallet)
-    }
-
     /// The real account's USDT wallet and the part of it already committed to
     /// open positions, open orders and locks (read-only).
     pub async fn usdt_account(&self, creds: &Credentials) -> Result<AccountBalance> {

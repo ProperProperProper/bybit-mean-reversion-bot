@@ -29,13 +29,15 @@ async fn backtest() -> Result<()> {
     let client = data::Client::new()?;
     let cache = data::Cache::open(dir.join("data.db").to_str().unwrap_or("data.db"))?;
     let creds = bybit_mean_reversion_bot::engine::keychain::load()?;
-    let balance = client.usdt_wallet_balance(&creds).await?;
+    let account = client.usdt_account(&creds).await?;
+    // Size from the free balance, as the service does.
+    let balance = account.wallet - account.reserved();
     let lots = client.usdt_perpetual_lots().await?;
     let lots = client
         .top_margin_tokens(&lots, walkforward::UNIVERSE)
         .await?;
     cache.put_instruments(&lots)?;
-    eprintln!("real account balance {balance:.2} USDT; measuring Bybit rules (fees, margin tiers, order books)...");
+    eprintln!("real account free balance {balance:.2} USDT; measuring Bybit rules (fees, margin tiers, order books)...");
     cache.put_rules(&client.fetch_rules(&creds, &lots).await?)?;
     let symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
     cache.put_universe(&symbols)?;

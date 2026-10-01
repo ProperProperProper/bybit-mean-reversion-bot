@@ -5,7 +5,7 @@ All numbers come from real Bybit data: closed 15-minute traded and mark-price ca
 ## Tests
 
 ```sh
-cargo test --release --all-targets   # 58 tests, all pass
+cargo test --release --all-targets   # 59 tests, all pass
 cargo clippy --all-targets -- -D warnings   # clean
 ```
 

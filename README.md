@@ -1,5 +1,7 @@
 # Bybit Mean Reversion Bot
 
+<img width="979" height="637" alt="Screenshot 2026-10-02 at 11 31 53 PM" src="https://github.com/user-attachments/assets/81e50efa-4784-4c55-85bd-2aff2bed2080" />
+
 A Rust paper-trading and research service for Bybit USDT perpetuals. It reads real exchange data: closed traded and mark-price candles, settled funding, instrument filters, margin tiers, this account's fees and wallet, and current order books. **It never places orders.**
 
 **Status (2 October 2026):** accounting, data and recovery fixes have regression tests; the follow-up review records remaining limitations ([audit](docs/audit.md)). The strategy is now **long only**. Its entry signal has a positive out-of-sample **relative** evidence (it picks coins that beat the average coin); the full long-only strategy, which also carries market risk, passes its walk-forward on 1 of 4 real 14-day data sets ([validation](docs/validation.md)). Paper trades only while the walk-forward gate allows. Agents: read [AGENTS.md](AGENTS.md).

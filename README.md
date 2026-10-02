@@ -1,4 +1,5 @@
 # Bybit Mean Reversion Bot
+<img width="974" height="632" alt="Screenshot 2026-10-02 at 10 31 40 PM" src="https://github.com/user-attachments/assets/37db4f1f-4353-4adf-aef9-549fd8d1326a" />
 
 A Rust paper-trading and research service for Bybit USDT perpetuals. It reads real exchange data: closed traded and mark-price candles, settled funding, instrument filters, margin tiers, this account's fees and wallet, and current order books. **It never places orders.**
 

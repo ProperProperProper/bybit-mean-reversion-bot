@@ -28,6 +28,24 @@ CalmDip was designed on the three research windows, so they cannot prove it. The
 
 If any criterion fails, CalmDip is **not** a proven edge, and this document will say so.
 
+**Correction to the registration text:** windows k = −3 … 0 span **2026-06-25 → 2026-08-20** (four 14-day windows), not 07-09 → 08-20. The registered window indices and count were used unchanged.
+
+### Holdout result: **PASS** (all three criteria)
+
+Data: `HOLDOUT=-3,-2,-1,0 fetch_research_data`. 831 USDT perpetual tokens ever listed; 517–527 alive per window, all with candles, 0 fetch failures. Study: `SIGNAL=CalmDip WINDOWS=-3,-2,-1,0 signal_ic <copy of holdout/>`; only CalmDip was evaluated.
+
+| Hold | IC per window (W−3 / W−2 / W−1 / W0) | Pooled IC (t) | 5 bought vs average coin, pooled (t) |
+|---|---|---|---|
+| 4h | −0.056 / −0.060 / −0.032 / −0.045 | −0.048 (−4.8) | +0.12% (+2.1) |
+| 8h | −0.078 / −0.068 / −0.061 / −0.102 | −0.077 (−5.3) | +0.29% (+2.7) |
+| 24h | −0.177 / −0.149 / −0.121 / −0.084 | −0.133 (−5.8) | **+0.85% (+2.7)** |
+
+1. IC negative in every window at 8h and 24h: **yes**.
+2. Pooled t ≤ −2 at both: **yes** (−5.3, −5.8).
+3. 24h excess of the 5 bought > 0.2%: **yes** (+0.85%).
+
+**What this proves and what it does not.** Out of sample, the coins CalmDip buys beat the **average coin** by about 0.85% per 24h before costs (about 0.65% after an estimated 0.2% round trip). That is a relative edge. A long-only account still carries the whole market's moves, which this test removes; the optional BTC trend filter is the only market-timing element, and it is not covered by this proof. The highest-ranked coins sometimes surge (+8.1% in W−3), so the signal does not support shorting. The sample is 44 non-overlapping days at the 24h hold. A coin delisted during a hold has no closing price and drops out of that sample.
+
 ### Walk-forward of the live grid (long-only CalmDip, 32 combinations)
 
 | Data | Verdict | OOS return | Profit factor | Trades | Liquidations |

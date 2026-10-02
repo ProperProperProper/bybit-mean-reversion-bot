@@ -24,19 +24,20 @@ Last updated 2026-10-02 by Claude Code. Read this before changing anything.
 
 - All findings in `docs/audit.md` are fixed with regression tests (mark-price funding/liquidation, isolated margin, neutral fills, lot rounding, risk-tier deductions, new listings, balance floor, and more).
 - Live grid: `walkforward::live_grid()` = long-only `Signal::CalmDip` (unflipped), hold 8h or 24h, 3 or 5 coins, 1× or 2×, stop none or 10%, BTC trend filter off or on (32 combos).
-- On real data it passes the walk-forward in 1 of 4 data sets; forward tests −9.8% and +21.9%, below an equal-weight buy-and-hold of the universe. **Not a proven edge.** See `docs/validation.md`.
+- The walk-forward of the full strategy (relative edge + market exposure + costs) passes in 1 of 4 data sets; forward tests −9.8% and +21.9%. The signal's relative edge is proven out of sample (above); whether the long-only *account* makes money also depends on the market. See `docs/validation.md`.
 
 ## Evidence and traps
 
 - **Survivorship / look-ahead bias:** the research windows (`window_k.db`) contain only *today's* top-50 coins. Coins are often top-turnover now *because* they just rallied, so long-only backtests on those windows look much better than reality (window 3: equal-weight +47%). Momentum-style long signals look good there and fail on the full historical universe.
 - **The unbiased test:** `cargo run --release --example signal_ic -- <dir>`, where `<dir>` holds `window_1..3.db` with candles for *every* perpetual that traded then. A copy is in the runtime folder under `backup-20261002-0029/` (pre-refetch windows: ~750 coins, traded candles + funding, no mark prices). It ranks the top 50 by turnover at each bar and measures each signal's rank correlation with next-open-to-close returns relative to the average coin, over non-overlapping holds.
-- On that full universe, two effects held in all 3 windows at every holding period: **higher volatility → lower relative return**, and **24h losers beat 24h winners**. `CalmDip` = mean of the volatility and 24h-return percentiles combines them (IC −0.05 to −0.18, t mostly ≤ −2 in all 9 window × horizon cells). It was designed after seeing these windows, so only **new data** can confirm it. The paper account is that test.
+- On that full universe, two effects held in all 3 windows at every holding period: **higher volatility → lower relative return**, and **24h losers beat 24h winners**. `CalmDip` = mean of the volatility and 24h-return percentiles combines them.
+- **CalmDip passed a pre-registered holdout test** (commits 5329e48 and 6988079 fixed the criteria and the definition before the data was fetched): four never-seen windows, 2026-06-25 → 08-20, full universe including delisted coins (`runtime/holdout/window_-3..0.db`). IC negative in every window; pooled t −5.3 (8h) and −5.8 (24h); the 5 coins bought beat the average coin by +0.85% per 24h (t 2.7). This is a proven **relative** edge, not market timing: long-only P&L still follows the market. Don't re-tune CalmDip on the holdout; it is spent as a test now. New ideas need their own fresh holdout (e.g. windows before 2026-06-25).
 - Pulse momentum (buying the strongest Pulse) *lost* to the average coin in all 3 windows on the full universe, even though it looks good on today's top 50.
 - At ~110 USDT, slots are 11–40 USDT, so lot rounding and minimum orders matter. Results are noisy, and single-coin moves dominate.
 
 ## Good next steps
 
-1. Let the paper account run on new data; compare it with equal-weight buy-and-hold of the same universe over the same days.
+1. Let the paper account run on new data; compare it with equal-weight buy-and-hold of the same universe over the same days (the edge is relative to that).
 2. Build an unbiased backtest: fetch mark candles, listing times (instruments-info with `status` filters for delisted coins) and funding for the full historical universe, so the walk-forward itself runs without survivorship bias.
 3. Test further entry ideas with `signal_ic` on the full universe *before* adding them to a grid. Only add signals whose sign holds in every window.
 4. Exits: a 24h hold is a blunt exit. Test take-profit / time-stop variants with `examples/risk_variants.rs` once the entry is settled.

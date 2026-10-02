@@ -15,6 +15,8 @@ Builds the research data:
 
 Any symbol still missing a candle after its listing start fails the run.
 
+**`HOLDOUT=k,k,…` mode:** for windows `k` (e.g. −3…0, before window 1), fetches traded candles for every USDT perpetual token that was trading then, **delisted ones included** (`perpetual_history`: instruments-info status `Trading` and `Closed`), into `holdout/window_k.db`. No credentials. This is the data for survivorship-free, never-seen tests with `signal_ic`.
+
 ## `research.rs`: `main()`
 
 Signal research, from the real balance (or `EQ=…`).

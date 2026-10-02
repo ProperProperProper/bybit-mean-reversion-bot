@@ -14,6 +14,10 @@
 //! before the top-50 refetch), the universe is the top 50 by turnover at each
 //! bar among all of them: no bias towards today's survivors. Holding periods
 //! do not overlap (one sample every h bars).
+//!
+//! `WINDOWS=-3,-2,-1,0` picks the windows (default 1,2,3); `SIGNAL=CalmDip`
+//! restricts the study to one signal (a pre-registered holdout tests only the
+//! signal it registered). The last column pools every sample.
 use bybit_mean_reversion_bot::engine::{research, scores, walkforward, xs, Market};
 
 const HORIZONS: [usize; 3] = [16, 32, 96];
@@ -111,8 +115,18 @@ fn main() -> anyhow::Result<()> {
     let dir = historical
         .clone()
         .unwrap_or_else(bybit_mean_reversion_bot::engine::runtime_dir);
-    let markets: Vec<Market> = (1..=3)
-        .map(|k| research::load_window(&dir, k))
+    let windows: Vec<i64> = std::env::var("WINDOWS")
+        .unwrap_or_else(|_| "1,2,3".into())
+        .split(',')
+        .map(|k| k.trim().parse())
+        .collect::<Result<_, _>>()?;
+    let only: Option<xs::Signal> = std::env::var("SIGNAL")
+        .ok()
+        .map(|s| serde_json::from_str(&format!("\"{s}\"")))
+        .transpose()?;
+    let markets: Vec<Market> = windows
+        .iter()
+        .map(|&k| research::load_window(&dir, k))
         .collect::<anyhow::Result<_>>()?;
     let sc: Vec<_> = markets
         .iter()
@@ -128,7 +142,10 @@ fn main() -> anyhow::Result<()> {
     );
     println!("IC = mean Spearman(signal, next-open-to-close excess return); t = IC t-stat");
     println!("buy low / buy high = mean excess return (%) of the {PICK} lowest / highest values\n");
-    for &signal in &walkforward::XS_SIGNALS {
+    for &signal in walkforward::XS_SIGNALS
+        .iter()
+        .filter(|s| only.is_none_or(|o| o == **s))
+    {
         let lookbacks: &[usize] = if signal == xs::Signal::Return {
             &[4, 16, 96]
         } else {
@@ -148,11 +165,20 @@ fn main() -> anyhow::Result<()> {
                 regime: xs::Regime::Off,
             };
             for h in HORIZONS {
-                let cells: Vec<String> = markets
+                let stats: Vec<Stat> = markets
                     .iter()
                     .zip(&sc)
-                    .map(|(m, s)| {
-                        let st = measure(m, s, &p, h);
+                    .map(|(m, s)| measure(m, s, &p, h))
+                    .collect();
+                let pooled = Stat {
+                    ic: stats.iter().flat_map(|x| x.ic.clone()).collect(),
+                    low_excess: stats.iter().flat_map(|x| x.low_excess.clone()).collect(),
+                    high_excess: stats.iter().flat_map(|x| x.high_excess.clone()).collect(),
+                };
+                let cells: Vec<String> = stats
+                    .iter()
+                    .chain(std::iter::once(&pooled))
+                    .map(|st| {
                         format!(
                             "IC {:+.3} t {:+4.1} low {:+5.2}% (t {:+4.1}) high {:+5.2}% (t {:+4.1}) n {}",
                             mean(&st.ic),
@@ -165,14 +191,14 @@ fn main() -> anyhow::Result<()> {
                         )
                     })
                     .collect();
+                let labels = windows.iter().map(|k| format!("W{k}")).chain(["pooled".into()]);
+                let row: Vec<String> = labels.zip(&cells).map(|(l, c)| format!("{l} {c}")).collect();
                 println!(
-                    "{:<12} lb {:>2} h {:>2} | W1 {} | W2 {} | W3 {}",
+                    "{:<12} lb {:>2} h {:>2} | {}",
                     format!("{signal:?}"),
                     lookback,
                     h,
-                    cells[0],
-                    cells[1],
-                    cells[2]
+                    row.join(" | ")
                 );
             }
         }

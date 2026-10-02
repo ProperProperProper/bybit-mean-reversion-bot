@@ -11,10 +11,67 @@ use bybit_mean_reversion_bot::engine::walkforward;
 use bybit_mean_reversion_bot::engine::{research, BAR_MS};
 use futures_util::{stream, StreamExt};
 
+/// `HOLDOUT=k,k,...`: traded candles only (what the signal study needs) for
+/// windows `k` (`research::window_bounds`, e.g. -3..0 = before window 1) into
+/// `holdout/window_k.db`, for every USDT perpetual token that was trading then,
+/// delisted ones included. No credentials needed.
+async fn holdout(client: &Client, windows: &str) -> anyhow::Result<()> {
+    let dir = bybit_mean_reversion_bot::engine::runtime_dir().join("holdout");
+    std::fs::create_dir_all(&dir)?;
+    let history = client.perpetual_history().await?;
+    println!("{} USDT perpetual tokens listed or delisted", history.len());
+    for k in windows.split(',') {
+        let k: i64 = k.trim().parse()?;
+        let (first, last) = research::window_bounds(k);
+        let alive: Vec<(String, i64)> = history
+            .iter()
+            .filter(|(_, launch, end)| *launch <= last && end.is_none_or(|e| e > first))
+            .map(|(s, launch, _)| (s.clone(), *launch))
+            .collect();
+        let cache = Cache::open(research::window_file(&dir, k).to_str().unwrap_or_default())?;
+        cache.put_instruments(
+            &alive
+                .iter()
+                .map(|(s, launch)| (s.clone(), None, *launch))
+                .collect::<Vec<_>>(),
+        )?;
+        let (client, cache2) = (client, &cache);
+        let mut jobs = stream::iter(alive.iter().map(|(s, _)| s.clone()))
+            .map(|s| async move {
+                let since = cache2.bars_since(&s, first, last)?;
+                if since <= last {
+                    let bars = client.klines_range(&s, since, last).await?;
+                    cache2.put_bars(&s, &bars)?;
+                    cache2.note_first_trade(&s, since, first, &bars)?;
+                }
+                anyhow::Ok(())
+            })
+            .buffer_unordered(6);
+        let mut failed = 0;
+        while let Some(r) = jobs.next().await {
+            if let Err(e) = r {
+                failed += 1;
+                eprintln!("  {e:#}");
+            }
+        }
+        let (with_bars, _) = cache.contents()?;
+        println!(
+            "holdout window {k}: {} symbols alive, {} with candles, {failed} failed",
+            alive.len(),
+            with_bars.len()
+        );
+        anyhow::ensure!(failed == 0, "holdout window {k} incomplete");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dir = bybit_mean_reversion_bot::engine::runtime_dir();
     let client = Client::new()?;
+    if let Ok(windows) = std::env::var("HOLDOUT") {
+        return holdout(&client, &windows).await;
+    }
+    let dir = bybit_mean_reversion_bot::engine::runtime_dir();
     let creds = keychain::load()?;
     println!(
         "account USDT wallet balance: {:.2}",

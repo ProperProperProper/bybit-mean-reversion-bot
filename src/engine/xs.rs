@@ -570,6 +570,12 @@ impl XsPortfolio {
         self.pending_targets = None;
         self.pending_params = None;
         self.pending_slot = 0.0;
+        self.effective_top = 0;
+        self.allocation_note = if allowed {
+            "settings changed: waiting for the next rebalance close".into()
+        } else {
+            "entry gate disabled".into()
+        };
         if !allowed {
             for pos in &mut self.positions {
                 if pos.next_action == Some(NextAction::Add) {
@@ -1423,9 +1429,11 @@ mod tests {
         let mut pf = XsPortfolio::new(1000.0);
         pending_pair(&mut pf, &p);
         pf.install_entry_gate(false);
+        assert_eq!(pf.allocation_note, "entry gate disabled");
         pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
         assert!(pf.positions.is_empty());
         pf.install_entry_gate(true);
+        assert!(pf.allocation_note.starts_with("settings changed"));
         pending_pair(&mut pf, &p);
         pf.defer_new_decisions(101 * BAR_MS + 1);
         pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);

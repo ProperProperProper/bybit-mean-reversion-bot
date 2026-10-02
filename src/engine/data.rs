@@ -104,13 +104,9 @@ impl Client {
             }
             let r = self.get("/v5/market/instruments-info", &q).await?;
             for i in r["list"].as_array().cloned().unwrap_or_default() {
-                if i["quoteCoin"] == "USDT"
+                if is_token_perpetual(&i)
                     && i["status"] == "Trading"
-                    && i["contractType"] == "LinearPerpetual"
                     && strict(&i["deliveryTime"]) == Some(0.0)
-                    && i["isPreListing"] == false
-                    && i["underlyingTicker"].as_str() == Some("")
-                    && matches!(i["symbolType"].as_str(), Some("" | "innovation"))
                 {
                     let l = &i["lotSizeFilter"];
                     let lot = (|| {
@@ -139,6 +135,43 @@ impl Client {
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Every USDT perpetual token Bybit lists as trading or closed (delisted):
+    /// (symbol, launch ms, delisting ms). The universe as it really was, for
+    /// survivorship-free research.
+    pub async fn perpetual_history(&self) -> Result<Vec<(String, i64, Option<i64>)>> {
+        let mut out = Vec::new();
+        for status in ["Trading", "Closed"] {
+            let mut cursor = String::new();
+            loop {
+                let mut q = format!("category=linear&status={status}&limit=1000");
+                if !cursor.is_empty() {
+                    q.push_str(&format!("&cursor={cursor}"));
+                }
+                let r = self.get("/v5/market/instruments-info", &q).await?;
+                for i in r["list"].as_array().cloned().unwrap_or_default() {
+                    if !is_token_perpetual(&i) {
+                        continue;
+                    }
+                    let (Some(symbol), Some(launch)) = (
+                        i["symbol"].as_str().filter(|s| !s.is_empty()),
+                        strict(&i["launchTime"]).filter(|t| *t > 0.0),
+                    ) else {
+                        continue;
+                    };
+                    let end = strict(&i["deliveryTime"]).filter(|t| *t > 0.0);
+                    out.push((symbol.to_string(), launch as i64, end.map(|e| e as i64)));
+                }
+                cursor = r["nextPageCursor"].as_str().unwrap_or_default().to_string();
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+        }
+        out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
         Ok(out)
     }
 
@@ -566,6 +599,17 @@ fn with_deductions(mut tiers: Vec<(MarginTier, Option<f64>)>) -> Option<Vec<Marg
         out.push(tier);
     }
     Some(out)
+}
+
+/// A USDT linear perpetual on a crypto token: no stock, ETF, forex or
+/// commodity contract (those carry an underlying ticker or another symbol
+/// type), and not a pre-listing.
+fn is_token_perpetual(i: &Value) -> bool {
+    i["quoteCoin"] == "USDT"
+        && i["contractType"] == "LinearPerpetual"
+        && i["isPreListing"] == false
+        && i["underlyingTicker"].as_str() == Some("")
+        && matches!(i["symbolType"].as_str(), Some("" | "innovation"))
 }
 
 /// The first `n` of `candidates` (ranked by turnover) that have complete Bybit

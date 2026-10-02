@@ -26,6 +26,8 @@ pub fn window_file(dir: &Path, k: i64) -> std::path::PathBuf {
 }
 
 /// Window `k` as a `Market` (every symbol it holds, with its Bybit rules).
+// NOTE(agents): A missing research window is an error, never a fallback to a
+// backup or fabricated bars. Changed deployments must refetch via deploy.sh.
 pub fn load_window(dir: &Path, k: i64) -> Result<Market> {
     let path = window_file(dir, k);
     anyhow::ensure!(

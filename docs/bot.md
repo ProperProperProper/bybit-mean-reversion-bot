@@ -5,7 +5,7 @@ Paper trading and signals only. It never places orders.
 ## `main.rs`
 
 - `bot serve`: the paper-trading service, using the runtime folder.
-- `bot backtest`: one live-equivalent run (real balance, current top 50, rules measured now, 14 days synced), printing the walk-forward report as JSON.
+- `bot backtest`: one historical simulation using the paper engine (real balance, current top 50, rules measured now, 14 days synced), printing the walk-forward report as JSON.
 
 ## `service.rs`
 
@@ -35,7 +35,7 @@ Loads the paper account, the Keychain credentials and the real balance (no crede
 
 ### `forward_test_daily(dir, start)`
 
-The console chart: settings chosen by the live walk-forward on research window 2 trade window 3, joined so the screener keeps its look-back. Totals plus one row per UTC day.
+The console chart: settings chosen by the live walk-forward on research window 2 trade window 3, joined so the screener keeps its look-back. Totals plus one row per UTC day. A simulation error or unclosed final position rejects the chart instead of publishing partial results.
 
 ### `bar_task`: once per closed 15-minute bar
 
@@ -55,4 +55,4 @@ A minimal HTTP server: `/` (the page), `/api/status`, `/api/signals`, `/api/rese
 
 ## Deployment (`deploy.sh`)
 
-Builds, runs every test target, installs to `~/Library/Application Support/BybitMeanReversionBot/bin/bot`, and (re)starts the launchd job `com.bybitmeanreversion.bot`, failing if launchd does not accept it. The installed binary is re-signed ad hoc with a fixed identifier (`SIGN_ID`), which the LuLu firewall allow rule for that path expects. Without that, every rebuild gets a new linker identifier, and the bot's connections wait on a firewall prompt.
+Builds, runs every test target and strict clippy, stops and verifies the old service/process, deletes stale runtime data, and refetches real research windows before it installs to `~/Library/Application Support/BybitMeanReversionBot/bin/bot`, and (re)starts the launchd job `com.bybitmeanreversion.bot`, failing if launchd does not accept it. The installed binary is re-signed ad hoc with a fixed identifier (`SIGN_ID`), which the LuLu firewall allow rule for that path expects. Without that, every rebuild gets a new linker identifier, and the bot's connections wait on a firewall prompt.

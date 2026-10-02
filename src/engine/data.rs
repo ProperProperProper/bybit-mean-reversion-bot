@@ -109,6 +109,9 @@ impl Client {
             }
             let r = self.get("/v5/market/instruments-info", &q).await?;
             for i in r["list"].as_array().cloned().unwrap_or_default() {
+                // NOTE(agents): Shared by live discovery and research fetching.
+                // Reject excluded instruments HERE, before requests for their
+                // tickers/rules/candles. Never add a separate permissive path.
                 if is_eligible_instrument(&i) {
                     let l = &i["lotSizeFilter"];
                     let lot = (|| {
@@ -408,14 +411,14 @@ impl Client {
     ) -> Result<Vec<(i64, Bar)>> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut out: Vec<(i64, Bar)> = Vec::new();
-        let mut page_end: Option<i64> = (end < now).then_some(end);
+        // NOTE(agents): Always send `end`. With only `start`, Bybit returns the FIRST 1000
+        //               candles after `start` (verified 2026-10-02), so this newest-first paging
+        //               stopped early and every fresh 14-day sync missed its last 344 bars.
+        let mut page_end = end.min(now);
         loop {
-            let mut q = format!(
-                "category=linear&symbol={symbol}&interval={INTERVAL}&limit=1000&start={start}"
+            let q = format!(
+                "category=linear&symbol={symbol}&interval={INTERVAL}&limit=1000&start={start}&end={page_end}"
             );
-            if let Some(e) = page_end {
-                q.push_str(&format!("&end={e}"));
-            }
             let r = self
                 .get(
                     if mark {
@@ -471,10 +474,10 @@ impl Client {
                 break;
             }
             anyhow::ensure!(
-                page_end.is_none_or(|e| oldest <= e),
+                oldest <= page_end,
                 "{symbol}: kline pagination did not progress"
             );
-            page_end = Some(oldest - 1);
+            page_end = oldest - 1;
         }
         out.sort_by_key(|x| x.0);
         out.dedup_by_key(|x| x.0);

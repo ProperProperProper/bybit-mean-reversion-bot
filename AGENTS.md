@@ -17,7 +17,7 @@ Required sequence:
 
 The user has explicitly authorized this reset after every change; do not ask again for discretionary confirmation. Request only permissions actually required by the environment. A denied permission or service-control operation is a blocker, not permission to bypass the restriction. This instruction overrides earlier advice to retain old runtime backups or paper state across deployments. Historical figures in documentation are records of past experiments, not inputs to reuse in a new run.
 
-Current reset status: the latest committed tree was reset and restarted fresh on 2026-10-02 by Claude Code (service stopped and verified, all runtime/research/holdout/backup data and disposable copies deleted, research windows and live data refetched from Bybit). A prepared stop/reset/deploy script is at `/Users/local.local/Documents/Codex/2026-10-01/l/outputs/fresh-start-bot.sh`; it checks the launchd job but not the process, so also verify with `pgrep -f 'BybitMeanReversionBot/bin/bot'` before deleting.
+Reset enforcement: `deploy.sh` now builds/tests/checks the current tree, stops launchd and verifies no bot process remains, deletes old runtime data, refetches research windows from Bybit, then installs and starts the current bot. Any stop, verification or refetch failure aborts deployment. Changes in the current batch still require this deployment before they are operationally complete.
 
 ## Notes in the code
 
@@ -81,3 +81,9 @@ Keep them current: if you change the behaviour a note describes, update or remov
 
 - Strict instrument eligibility also requires a finite Bybit `leverageFilter.maxLeverage > 1`. Missing, malformed and 1x-only contracts are rejected before ranking, rule requests, scoring or fetching candles, in live and research discovery.
 - Held symbols outside the top 50 remain managed only while still instrument-eligible. Excluded held symbols are purged and require explicit recovery; no excluded-symbol candle requests are made.
+
+## Strict test-representation rule — user instruction
+
+Tests must use the production engine and actual eligibility, quantity/minimum-order, free-balance, fee, funding, mark/liquidation and decision-time rules whenever claiming to represent the bot. Never use a simplified profitable surrogate or future information. State what the test measures: unit regression, historical simulation, prospective paper run or actual exchange execution.
+
+Historical simulations are not verified live execution: current universe/books/fees/tiers applied to past candles, unverified history coverage and report latency, and candle-level intrabar ambiguity must be disclosed. Do not present simulated fills as exchange fills or historical returns as live account profit. The chart exposes its assumptions. A true live-parity claim requires replaying recorded decision/report timestamps and contemporaneous account/market inputs through the same paper-service path, with independent outcomes; actual exchange fills require exchange execution records.

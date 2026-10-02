@@ -326,6 +326,8 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
         }),
         signals: RwLock::new(vec![]),
         paper: RwLock::new(paper),
+        // NOTE(agents): The chart belongs to THIS process and current engine only.
+        // Never deserialize an old chart or reuse a prior deployment's result.
         research: RwLock::new(None),
     });
 
@@ -382,6 +384,9 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
 /// the real account balance. The earlier window only supplies the screener's look-back
 /// at the start, as the live bot has it. Real cached Bybit bars + funding only
 /// (research windows 2 and 3, `engine::research`); errors if missing.
+// NOTE(agents): This is a HISTORICAL forward simulation, not live paper P&L.
+// deploy.sh deletes/refetches these inputs before starting a changed build.
+// Selection uses window 2 only; window 3 must never affect parameter selection.
 fn forward_test_daily(dir: &Path, start: f64) -> Result<serde_json::Value> {
     let markets = [
         research::load_window(dir, 2)?,
@@ -410,6 +415,13 @@ fn forward_test_daily(dir: &Path, start: f64) -> Result<serde_json::Value> {
         .params
         .ok_or_else(|| anyhow::anyhow!("no settings qualified on the first 14 days"))?;
     xs::run_daily(&all, &sc_all, BARS..2 * BARS, &p, &mut pf, &mut days, true);
+    // NOTE(agents): An incomplete or failed simulation is never a valid chart.
+    // This checks terminal funding/exit failures as well as persisted values.
+    pf.validate_state()?;
+    anyhow::ensure!(
+        pf.positions.is_empty(),
+        "forward chart has unclosed positions"
+    );
     let segments = vec![serde_json::json!({
         "chosen_on": [markets[0].ts[0], markets[0].ts[BARS - 1] + BAR_MS],
         "traded": [markets[1].ts[0], markets[1].ts[BARS - 1] + BAR_MS],
@@ -422,6 +434,12 @@ fn forward_test_daily(dir: &Path, start: f64) -> Result<serde_json::Value> {
         "trades": m.trades, "wins": m.wins, "profit_factor": m.profit_factor(), "liquidations": m.liquidations,
         "fees": pf.trades.iter().map(|t| t.fees).sum::<f64>(), "funding": pf.trades.iter().map(|t| t.funding).sum::<f64>(),
         "segments": segments, "days": days,
+        "test_kind": "historical_simulation",
+        "assumptions": [
+            "Uses the paper engine; no exchange orders or actual fills.",
+            "Today's eligible universe, fees, risk tiers and order books are applied to historical candles.",
+            "Historical report latency, intrabar price order and funding-history completeness are not verified."
+        ],
     }))
 }
 
@@ -877,7 +895,7 @@ table{border-collapse:collapse;font-size:12px}td,th{padding:2px 8px;text-align:r
 <section><b>Next rebalance targets</b> <span class=k id=sighelp></span><table id=sig></table></section>
 <section><b>Live event log</b><pre id=ev></pre></section>
 <section><b>Recent paper trades</b><table id=tr></table></section>
-<section><b>Forward test, day by day</b> <span class=k>(14 days of real Bybit data the settings never saw: chosen on the previous 14 days, then traded these 14; same engine, fees, slippage, funding and lot rules as paper)</span><div id=fsum class=k></div><div id=fchart></div><table id=fdays></table></section>
+<section><b>Forward test, day by day</b> <span class=k>(historical simulation: settings chosen on the preceding 14 days, then tested on these 14 using the paper engine; current universe and execution measurements, simulated fills)</span><div id=fsum class=k></div><div id=fchart></div><table id=fdays></table></section>
 <section><b>Walk-forward (14 days of 15m bars, re-run every bar)</b><pre id=wf></pre></section>
 <script>
 const f=(x,d=2)=>x==null||isNaN(x)?'-':Number(x).toFixed(d);
@@ -916,15 +934,25 @@ UNSEEN-DATA TEST (the number that counts): 3 separate 2-day windows the settings
 SELF-CHECK (not a forecast — the settings were chosen on 8 of these 14 days): ${full.trades} trades, ${sg((full.end_equity||0)-(full.start_equity||0))} USDT (${pc(((full.end_equity||0)/(full.start_equity||1)-1)*100)}), max drawdown ${f(full.max_drawdown_pct,1)}% — only used to reject settings that liquidate or fall > 25%
 ${r.evaluated} backtests in ${r.elapsed_ms} ms, real closed 15m Bybit bars ${t(r.first_bar_ts)} → ${t(r.last_bar_ts+900000)}`:'waiting for the first closed bar…';
 }catch(e){}}
+// NOTE(agents): Clear old geometry before loading. An unavailable/error result
+// must never leave a previous successful chart visible beside a new status.
 async function research(){try{
+document.getElementById('fchart').innerHTML='';
+document.getElementById('fdays').innerHTML='';
 const r=await (await fetch('/api/research')).json();
 if(!r){document.getElementById('fsum').textContent='computing from the cached real data…';setTimeout(research,10000);return}
 if(r.error){document.getElementById('fsum').textContent='unavailable: '+r.error;return}
+// NOTE(agents): Keep execution assumptions visible; a simulated historical
+// chart must never be presented as actual live fills or realised profit.
 const F=(x,d=2)=>Number(x).toFixed(d),S=x=>(x>=0?'+':'')+F(x),P=x=>S(x)+'%',D=ms=>new Date(ms).toISOString().slice(5,10);
 const days=r.days,pos=days.filter(d=>d.pnl>0).length;
 const best=days.reduce((a,d)=>d.pnl>a.pnl?d:a,days[0]),worst=days.reduce((a,d)=>d.pnl<a.pnl?d:a,days[0]);
 document.getElementById('fsum').innerHTML=`${F(r.start_equity,0)} → <b>${F(r.end_equity)} USDT</b> = <b class=${r.net>=0?'ok':'bad'}>${S(r.net)} USDT (${P(r.return_pct)})</b> over ${F((r.segments[0].traded[1]-r.segments[0].traded[0])/864e5,0)} days (${new Date(r.segments[0].traded[0]).toISOString().slice(0,16).replace("T"," ")} → ${new Date(r.segments[0].traded[1]).toISOString().slice(0,16).replace("T"," ")} UTC) · ${pos} of ${days.length} UTC dates up · best day ${D(best.day_ts)} ${S(best.pnl)} (${P(best.pnl_pct)}) · worst day ${D(worst.day_ts)} ${S(worst.pnl)} (${P(worst.pnl_pct)}) · max drawdown ${F(r.max_drawdown_pct,1)}% · ${r.trades} trades, ${r.wins} wins · profit factor ${F(r.profit_factor)} · fees ${F(r.fees)} · funding ${S(-r.funding)} · liquidations ${r.liquidations}<br>`+
  r.segments.map((s,i)=>`segment ${i+1}: settings chosen on ${D(s.chosen_on[0])}–${D(s.chosen_on[1])}, traded ${D(s.traded[0])}–${D(s.traded[1])}: ${S(s.end_equity-s.start_equity)} USDT (${P((s.end_equity/s.start_equity-1)*100)}) — ${s.params.signal} ${s.params.flip?'follow':'contrarian'}, top ${s.params.top}, every ${s.params.hold/4}h, ${s.params.gross_leverage}x, stop ${s.params.stop_pct??'none'}`).join('<br>');
+const assumptions=document.createElement('div');
+assumptions.className='k';
+assumptions.textContent=(r.assumptions||[]).join(' ');
+document.getElementById('fsum').appendChild(assumptions);
 const W=960,H=320,L=60,R=10,T=10,eqH=170,gap=20,bH=H-T-eqH-gap-24,n=days.length,bw=(W-L-R)/n;
 const eqs=[r.start_equity,...days.map(d=>d.equity)],lo=Math.min(...eqs),hi=Math.max(...eqs);
 const ey=v=>T+eqH-(v-lo)/(hi-lo||1)*eqH, mx=Math.max(...days.map(d=>Math.abs(d.pnl)))||1, by0=T+eqH+gap+bH/2, by=v=>by0-v/mx*bH/2;
@@ -943,6 +971,8 @@ document.getElementById('fchart').innerHTML=g+`<text x=${L} y=${by0-bH/2-4} fill
 document.getElementById('fdays').innerHTML='<tr><th>Day (UTC)<th>P&L USDT<th>P&L %<th>Equity<th>Trades closed<th>Wins</tr>'+days.map(d=>`<tr><td>${new Date(d.day_ts).toISOString().slice(0,10)}<td class=${d.pnl>=0?'ok':'bad'}>${S(d.pnl)}<td class=${d.pnl>=0?'ok':'bad'}>${P(d.pnl_pct)}<td>${F(d.equity)}<td>${d.trades}<td>${d.wins}</tr>`).join('');
 }catch(e){document.getElementById('fsum').textContent='chart error: '+e}}
 research();
+// NOTE(agents): Reload on process restart: the page embeds strategy labels and
+// chart code. Polling new numbers into an old page would mix code versions.
 let boot=null;
 async function guard(){try{const s=await (await fetch('/api/status')).json();if(boot&&s.started_ms!==boot)location.reload();boot=s.started_ms;}catch(e){}}
 tick();guard();setInterval(tick,5000);setInterval(guard,15000);

@@ -16,6 +16,42 @@ SIGN_ID="bot-06c819130362ed6a"
 cd "$REPO"
 cargo build --release --bin bot
 cargo test --release --all-targets
+cargo clippy --all-targets -- -D warnings
+python3 -m unittest discover -s tests -p 'test_*.py'
+cargo build --release --example fetch_research_data
+
+# NOTE(agents): EVERY deployment starts from fresh data. Stop and verify both
+# launchd and its process before deleting anything; denied control must fail.
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/$LABEL"
+fi
+for _ in $(seq 1 30); do
+    if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    echo "fresh reset failed: launchd job still loaded" >&2; exit 1
+fi
+python3 - "$RUNTIME" <<'RESET_PY'
+import pathlib, shutil, subprocess, sys
+runtime = pathlib.Path(sys.argv[1])
+probe = subprocess.run(['pgrep', '-f', '[B]ybitMeanReversionBot/bin/bot'], capture_output=True, text=True)
+if probe.returncode != 1 or probe.stderr.strip():
+    raise SystemExit('fresh reset failed: bot still running or process verification denied: ' + probe.stderr.strip())
+if runtime.exists():
+    for path in runtime.iterdir():
+        if path.name == 'bin':
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+print('Deleted stale runtime caches, paper history, research/holdout data, backups and logs.')
+RESET_PY
+
+# Fresh historical inputs for the current-code chart, never old snapshots.
+# Failure leaves the service stopped instead of showing an old/invalid chart.
+target/release/examples/fetch_research_data
 
 mkdir -p "$RUNTIME/bin" "$RUNTIME/logs"
 install -m 0755 target/release/bot "$RUNTIME/bin/bot.new"
@@ -46,9 +82,6 @@ cat > "$PLIST" <<PLIST_EOF
 PLIST_EOF
 plutil -lint "$PLIST" >/dev/null
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-# Wait until launchd has fully removed the old job, then load (retry briefly).
-for _ in $(seq 1 30); do launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break; sleep 1; done
 started=false
 for i in 1 2 3 4 5; do
     if launchctl bootstrap "gui/$(id -u)" "$PLIST"; then started=true; break; fi

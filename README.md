@@ -20,7 +20,7 @@ A Rust paper-trading and research service for Bybit USDT perpetuals. It reads re
 
 ```sh
 ./deploy.sh                                   # build, test, install, (re)start the launchd service
-cargo run --release --bin bot -- backtest     # one live-equivalent walk-forward (needs credentials)
+cargo run --release --bin bot -- backtest     # one historical walk-forward using the paper engine (needs credentials)
 cargo run --release --example fetch_research_data
 EQ=<balance> cargo run --release --example research
 cargo run --release --example validate_cached -- SNAPSHOT_DIR <balance> out.json

@@ -154,6 +154,9 @@ pub enum NextAction {
     TakeProfit,
     Add,
     Rebalance,
+    /// The token is no longer trading normally (delisted or delisting
+    /// scheduled): close at the next open, never overridden.
+    Delisting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,6 +567,20 @@ impl XsPortfolio {
         }
     }
 
+    /// Queue an exit at the next open for every held token not in `trading`
+    /// (Bybit's tokens that trade with no delisting scheduled). Returns them.
+    pub fn exit_delisting(&mut self, trading: &std::collections::HashSet<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        for pos in &mut self.positions {
+            if !trading.contains(&pos.symbol) && pos.next_action != Some(NextAction::Delisting) {
+                pos.next_action = Some(NextAction::Delisting);
+                pos.action_not_before = 0;
+                out.push(pos.symbol.clone());
+            }
+        }
+        out
+    }
+
     /// Cancel queued entries when the report changes; retain risk exits.
     pub fn install_entry_gate(&mut self, allowed: bool) {
         self.entries_allowed = allowed;
@@ -789,6 +806,12 @@ impl XsPortfolio {
                     }
                     continue;
                 }
+                (Some(NextAction::Delisting), Some(b)) => {
+                    if !self.close_market(m, i, ts, b.open, "Delisting") {
+                        return;
+                    }
+                    continue;
+                }
                 (Some(action), None) => self.positions[i].next_action = Some(action),
                 (Some(NextAction::Add), Some(_)) if !rebalancing && self.entries_allowed => {
                     self.add(m, t, i, p)
@@ -947,7 +970,12 @@ impl XsPortfolio {
             let against = -s * (b.close - pos.entry) / pos.entry * 100.0;
             let pending_exit = matches!(
                 pos.next_action,
-                Some(NextAction::Stop | NextAction::TakeProfit | NextAction::Rebalance)
+                Some(
+                    NextAction::Stop
+                        | NextAction::TakeProfit
+                        | NextAction::Rebalance
+                        | NextAction::Delisting
+                )
             );
             if pending_exit {
                 i += 1;
@@ -1721,6 +1749,25 @@ mod tests {
         let m = market(&[vec![100.0; 200], vec![100.0; 200]]);
         assert!(!regime_allows(&m, 150, Regime::BtcTrend));
         assert!(regime_allows(&m, 150, Regime::Off));
+    }
+
+    #[test]
+    fn delisting_tokens_exit_at_the_next_open() {
+        let m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        let p = risk_params(Risk {
+            add_pct: Some(1.0),
+            ..Default::default()
+        });
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.open(&m, 100, 1, Side::Long, 200.0, &p);
+        let trading: std::collections::HashSet<String> = ["S1USDT".to_string()].into();
+        assert_eq!(pf.exit_delisting(&trading), vec!["S0USDT".to_string()]);
+        assert!(pf.exit_delisting(&trading).is_empty(), "queued once");
+        pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
+        assert_eq!(pf.positions.len(), 1);
+        assert_eq!(pf.positions[0].symbol, "S1USDT");
+        assert_eq!(pf.trades[0].reason, "Delisting");
     }
 
     #[test]

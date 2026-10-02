@@ -154,8 +154,9 @@ fn advance_paper(
     next: &XsParams,
     allowed: bool,
     ready_ts: i64,
-    observed: Option<data::AccountBalance>,
-) -> Result<()> {
+    // The real account and the tokens trading normally, observed this bar.
+    observed: Option<(data::AccountBalance, &std::collections::HashSet<String>)>,
+) -> Result<Vec<String>> {
     anyhow::ensure!(!market.ts.is_empty(), "empty paper market");
     anyhow::ensure!(
         market.ts.windows(2).all(|w| w[1] - w[0] == BAR_MS),
@@ -221,7 +222,7 @@ fn advance_paper(
             }
         }
     }
-    if let Some(account) = observed {
+    if let Some((account, _)) = observed {
         let balance = account.wallet;
         anyhow::ensure!(
             balance.is_finite() && balance >= 0.0,
@@ -243,10 +244,13 @@ fn advance_paper(
         candidate.portfolio.install_entry_gate(allowed);
     }
     candidate.params = Some(next.clone());
+    // Delisting is known from now on: held tokens Bybit no longer lists as
+    // trading normally exit at the next open (never at a replayed bar).
+    let delisting = observed.map_or_else(Vec::new, |(_, t)| candidate.portfolio.exit_delisting(t));
     candidate.portfolio.decide_close(market, sc, t, next);
     candidate.portfolio.defer_new_decisions(ready_ts);
     *ps = candidate;
-    Ok(())
+    Ok(delisting)
 }
 
 struct App {
@@ -433,6 +437,10 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // their full Bybit rules: order rules, the account's fees, margin tiers,
         // measured books. The universe is the top 50 with complete rules.
         let lots = app.client.usdt_perpetual_lots().await?;
+        // Tokens trading with no delisting scheduled: everything else is
+        // hard-excluded (never entered, held ones exit, stored rows deleted).
+        let trading: std::collections::HashSet<String> =
+            lots.iter().map(|(s, _, _)| s.clone()).collect();
         let candidates = app
             .client
             .top_margin_tokens(&lots, walkforward::CANDIDATES)
@@ -483,6 +491,16 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             }
         }
         symbols.sort();
+        // Purge every stored row of tokens that are neither trading nor held.
+        let keep: std::collections::HashSet<String> =
+            trading.iter().chain(&symbols).cloned().collect();
+        let purged = app.cache.retain_symbols(&keep)?;
+        if purged > 0 {
+            app.event(
+                "INFO",
+                format!("purged stored data of {purged} delisted or non-token symbol(s)"),
+            );
+        }
         let hb2 = hb.clone();
         let last = data::sync(&app.client, &app.cache, &symbols, move |_, _| hb2.beat()).await?;
         if last < closed {
@@ -598,20 +616,23 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                 );
                 // The symbol list is re-fetched every bar: re-point positions by name.
                 ps.portfolio.reindex(&market.symbols);
-                advance_paper(
+                let delisting = advance_paper(
                     ps,
                     &market,
                     &sc,
                     &p,
                     report.passed || report.forward_ok(),
                     chrono::Utc::now().timestamp_millis(),
-                    Some(account),
+                    Some((account, &trading)),
                 )?;
                 persist_paper(&app.dir.join(PAPER_FILE), ps)?;
                 let mut lines: Vec<String> = flow
                     .map(|d| format!("ACCOUNT observed external wallet change {d:+.8} USDT (now {balance:.8}): paper capital adjusted after replay; source unclassified"))
                     .into_iter()
                     .collect();
+                lines.extend(delisting.iter().map(|s| {
+                    format!("PAPER {s} is delisted or delisting: exit queued for the next open")
+                }));
                 lines.extend(ps.portfolio.trades[before_trades..].iter().map(|t| {
                     format!(
                         "PAPER close {:?} {} ({}) pnl {:+.2} USDT, held {}m",

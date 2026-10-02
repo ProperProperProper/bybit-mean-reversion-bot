@@ -191,8 +191,14 @@ fn main() -> anyhow::Result<()> {
                         )
                     })
                     .collect();
-                let labels = windows.iter().map(|k| format!("W{k}")).chain(["pooled".into()]);
-                let row: Vec<String> = labels.zip(&cells).map(|(l, c)| format!("{l} {c}")).collect();
+                let labels = windows
+                    .iter()
+                    .map(|k| format!("W{k}"))
+                    .chain(["pooled".into()]);
+                let row: Vec<String> = labels
+                    .zip(&cells)
+                    .map(|(l, c)| format!("{l} {c}"))
+                    .collect();
                 println!(
                     "{:<12} lb {:>2} h {:>2} | {}",
                     format!("{signal:?}"),

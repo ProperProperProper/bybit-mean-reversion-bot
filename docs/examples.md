@@ -15,7 +15,9 @@ Builds the research data:
 
 Any symbol still missing a candle after its listing start fails the run.
 
-**`HOLDOUT=k,k,…` mode:** for windows `k` (e.g. −3…0, before window 1), fetches traded candles for every USDT perpetual token that was trading then, **delisted ones included** (`perpetual_history`: instruments-info status `Trading` and `Closed`), into `holdout/window_k.db`. No credentials. This is the data for survivorship-free, never-seen tests with `signal_ic`.
+**`HOLDOUT=k,k,…` mode:** for windows `k` (e.g. −3…0, before window 1), fetches traded candles for every USDT perpetual token trading today with no delisting scheduled into `holdout/window_k.db`, for never-seen tests with `signal_ic`. No credentials.
+
+**Delisted tokens are hard-excluded** in both modes: they are never fetched, and `Cache::retain_symbols` deletes any stored rows of tokens that are not trading (delisted, delisting, or non-token contracts).
 
 ## `research.rs`: `main()`
 
@@ -29,7 +31,7 @@ Long-only families by default (`NEUTRAL=1` for the market-neutral ones), plus bu
 
 ## `signal_ic.rs`: entry-signal study
 
-`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory whose `window_1..3.db` hold candles for **every** perpetual that traded then; the universe is then the top 50 by turnover at each bar, which avoids the bias towards today's top coins. No network.
+`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory of windows holding candles for every trading token (e.g. `holdout/`, or the purged backup windows); the universe is then the top 50 by turnover at each bar rather than today's top 50. `WINDOWS=` picks windows, `SIGNAL=` one signal. No network.
 
 ## `risk_variants.rs`: `main()`
 

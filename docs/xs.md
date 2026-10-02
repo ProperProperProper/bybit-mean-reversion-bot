@@ -103,6 +103,8 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 6. Funding stamped at this bar's close is charged at the next bar's mark open. On the newest loaded bar it waits for that bar.
 7. Breaker check, then `decide_close`, then peak and drawdown.
 
+**`exit_delisting(trading)`** queues a `Delisting` exit at the next open for every held token not in `trading`; nothing overrides it.
+
 **`decide_close`** fixes targets, parameters and slot budget at aligned closes. **`install_entry_gate`** cancels queued entries (and adds, when disabled) when settings or eligibility change. **`defer_new_decisions`** makes a live decision fill no earlier than the open after it was ready. **`validate_state`** rejects corrupt persisted state. **`close_all`** closes everything at the last traded close with book cost and fee.
 
 ## Daily rows and backtests

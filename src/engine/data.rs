@@ -138,43 +138,6 @@ impl Client {
         Ok(out)
     }
 
-    /// Every USDT perpetual token Bybit lists as trading or closed (delisted):
-    /// (symbol, launch ms, delisting ms). The universe as it really was, for
-    /// survivorship-free research.
-    pub async fn perpetual_history(&self) -> Result<Vec<(String, i64, Option<i64>)>> {
-        let mut out = Vec::new();
-        for status in ["Trading", "Closed"] {
-            let mut cursor = String::new();
-            loop {
-                let mut q = format!("category=linear&status={status}&limit=1000");
-                if !cursor.is_empty() {
-                    q.push_str(&format!("&cursor={cursor}"));
-                }
-                let r = self.get("/v5/market/instruments-info", &q).await?;
-                for i in r["list"].as_array().cloned().unwrap_or_default() {
-                    if !is_token_perpetual(&i) {
-                        continue;
-                    }
-                    let (Some(symbol), Some(launch)) = (
-                        i["symbol"].as_str().filter(|s| !s.is_empty()),
-                        strict(&i["launchTime"]).filter(|t| *t > 0.0),
-                    ) else {
-                        continue;
-                    };
-                    let end = strict(&i["deliveryTime"]).filter(|t| *t > 0.0);
-                    out.push((symbol.to_string(), launch as i64, end.map(|e| e as i64)));
-                }
-                cursor = r["nextPageCursor"].as_str().unwrap_or_default().to_string();
-                if cursor.is_empty() {
-                    break;
-                }
-            }
-        }
-        out.sort();
-        out.dedup_by(|a, b| a.0 == b.0);
-        Ok(out)
-    }
-
     /// Current top margin-eligible token perpetuals by public 24h turnover.
     pub async fn top_margin_tokens(
         &self,
@@ -866,6 +829,39 @@ impl Cache {
         })
     }
 
+    /// Delete every stored row (candles, marks, funding, rules, listing data,
+    /// universe) of symbols not in `keep`: delisted tokens never stay in the
+    /// data. Returns how many symbols were removed.
+    pub fn retain_symbols(&self, keep: &std::collections::HashSet<String>) -> Result<usize> {
+        const TABLES: [&str; 7] = [
+            "bars",
+            "marks",
+            "funding",
+            "rules",
+            "instruments",
+            "first_trades",
+            "universe",
+        ];
+        self.with(|c| {
+            let mut stored = std::collections::BTreeSet::new();
+            for table in TABLES {
+                let mut st = c.prepare(&format!("SELECT DISTINCT symbol FROM {table}"))?;
+                for s in st.query_map([], |r| r.get::<_, String>(0))? {
+                    stored.insert(s?);
+                }
+            }
+            let gone: Vec<String> = stored.into_iter().filter(|s| !keep.contains(s)).collect();
+            let tx = c.transaction()?;
+            for symbol in &gone {
+                for table in TABLES {
+                    tx.execute(&format!("DELETE FROM {table} WHERE symbol=?1"), [symbol])?;
+                }
+            }
+            tx.commit()?;
+            Ok(gone.len())
+        })
+    }
+
     /// Symbols with stored Bybit rules.
     pub fn rules_symbols(&self) -> Result<std::collections::HashSet<String>> {
         self.with(|c| {
@@ -1100,6 +1096,44 @@ mod gap_tests {
             .note_first_trade("OLD", earliest, earliest, &[(earliest + BAR_MS, b)])
             .unwrap();
         assert_eq!(cache.bars_since("OLD", earliest, last).unwrap(), earliest);
+    }
+
+    #[test]
+    fn retain_symbols_purges_delisted_tokens_everywhere() {
+        let cache = Cache::open(":memory:").unwrap();
+        let b = Bar {
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+            turnover: 1.0,
+        };
+        for s in ["BTCUSDT", "GONEUSDT"] {
+            cache.put_bars(s, &[(0, b)]).unwrap();
+            cache.put_marks(s, &[(0, b)]).unwrap();
+            cache.put_funding(s, &[(0, 0.0001)]).unwrap();
+        }
+        cache
+            .put_instruments(&[("BTCUSDT".into(), None, 1), ("GONEUSDT".into(), None, 1)])
+            .unwrap();
+        cache
+            .put_rules(&[(
+                "GONEUSDT".into(),
+                crate::engine::rules::Rules::test_liquid(),
+            )])
+            .unwrap();
+        let keep: std::collections::HashSet<String> = ["BTCUSDT".to_string()].into();
+        assert_eq!(cache.retain_symbols(&keep).unwrap(), 1);
+        assert_eq!(cache.contents().unwrap().0, vec!["BTCUSDT".to_string()]);
+        assert!(cache.rules_symbols().unwrap().is_empty());
+        let m = cache.market(&["GONEUSDT".into()], 0).unwrap();
+        assert!(
+            m.bars[0][BARS - 1].is_none()
+                && m.funding[0].is_empty()
+                && m.listing_times[0].is_none()
+        );
+        assert_eq!(cache.retain_symbols(&keep).unwrap(), 0);
     }
 
     #[test]

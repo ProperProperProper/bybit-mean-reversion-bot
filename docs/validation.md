@@ -32,7 +32,7 @@ If any criterion fails, CalmDip is **not** a proven edge, and this document will
 
 ### Holdout result: **PASS** (all three criteria)
 
-Data: `HOLDOUT=-3,-2,-1,0 fetch_research_data`. 831 USDT perpetual tokens ever listed; 517–527 alive per window, all with candles, 0 fetch failures. Study: `SIGNAL=CalmDip WINDOWS=-3,-2,-1,0 signal_ic <copy of holdout/>`; only CalmDip was evaluated.
+Data (original run): every USDT perpetual token alive in each window, delisted ones included (831 ever listed; 517–527 alive per window), all with candles, 0 fetch failures. The fetcher now hard-excludes delisted tokens (see the rerun below). Study: `SIGNAL=CalmDip WINDOWS=-3,-2,-1,0 signal_ic <copy of holdout/>`; only CalmDip was evaluated.
 
 | Hold | IC per window (W−3 / W−2 / W−1 / W0) | Pooled IC (t) | 5 bought vs average coin, pooled (t) |
 |---|---|---|---|
@@ -43,6 +43,8 @@ Data: `HOLDOUT=-3,-2,-1,0 fetch_research_data`. 831 USDT perpetual tokens ever l
 1. IC negative in every window at 8h and 24h: **yes**.
 2. Pooled t ≤ −2 at both: **yes** (−5.3, −5.8).
 3. 24h excess of the 5 bought > 0.2%: **yes** (+0.85%).
+
+**Rerun with delisted tokens hard-excluded (user request, same day).** Delisted tokens were then purged from every database and are never fetched (7–22 per holdout window). The same test on the purged data still passes all three criteria: IC per window at 24h −0.183 / −0.143 / −0.126 / −0.093; pooled t −5.5 (8h) and −6.0 (24h); the 5 bought beat the average coin by +0.89% per 24h (t 2.8). Note that excluding delisted tokens makes this run slightly survivorship-biased; the original run above, with them included, is the unbiased one, and it passed too.
 
 **What this proves and what it does not.** Out of sample, the coins CalmDip buys beat the **average coin** by about 0.85% per 24h before costs (about 0.65% after an estimated 0.2% round trip). That is a relative edge. A long-only account still carries the whole market's moves, which this test removes; the optional BTC trend filter is the only market-timing element, and it is not covered by this proof. The highest-ranked coins sometimes surge (+8.1% in W−3), so the signal does not support shorting. The sample is 44 non-overlapping days at the 24h hold. A coin delisted during a hold has no closing price and drops out of that sample.
 
@@ -69,7 +71,7 @@ All numbers come from real Bybit data: closed 15-minute traded and mark-price ca
 ## Tests
 
 ```sh
-cargo test --release --all-targets   # 62 tests, all pass
+cargo test --release --all-targets   # 64 tests, all pass
 cargo clippy --all-targets -- -D warnings   # clean
 ```
 

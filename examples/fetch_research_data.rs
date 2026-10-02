@@ -10,33 +10,34 @@ use bybit_mean_reversion_bot::engine::keychain;
 use bybit_mean_reversion_bot::engine::walkforward;
 use bybit_mean_reversion_bot::engine::{research, BAR_MS};
 use futures_util::{stream, StreamExt};
+use std::collections::HashSet;
 
 /// `HOLDOUT=k,k,...`: traded candles only (what the signal study needs) for
 /// windows `k` (`research::window_bounds`, e.g. -3..0 = before window 1) into
-/// `holdout/window_k.db`, for every USDT perpetual token that was trading then,
-/// delisted ones included. No credentials needed.
+/// `holdout/window_k.db`, for every USDT perpetual token trading today with no
+/// delisting scheduled. Delisted tokens are hard-excluded: never fetched, and
+/// any stored rows of theirs are deleted. No credentials needed.
 async fn holdout(client: &Client, windows: &str) -> anyhow::Result<()> {
     let dir = bybit_mean_reversion_bot::engine::runtime_dir().join("holdout");
     std::fs::create_dir_all(&dir)?;
-    let history = client.perpetual_history().await?;
-    println!("{} USDT perpetual tokens listed or delisted", history.len());
+    let lots = client.usdt_perpetual_lots().await?;
+    let trading: HashSet<String> = lots.iter().map(|(s, _, _)| s.clone()).collect();
+    println!(
+        "{} USDT perpetual tokens trading, no delisting scheduled",
+        lots.len()
+    );
     for k in windows.split(',') {
         let k: i64 = k.trim().parse()?;
         let (first, last) = research::window_bounds(k);
-        let alive: Vec<(String, i64)> = history
-            .iter()
-            .filter(|(_, launch, end)| *launch <= last && end.is_none_or(|e| e > first))
-            .map(|(s, launch, _)| (s.clone(), *launch))
-            .collect();
         let cache = Cache::open(research::window_file(&dir, k).to_str().unwrap_or_default())?;
-        cache.put_instruments(
-            &alive
-                .iter()
-                .map(|(s, launch)| (s.clone(), None, *launch))
-                .collect::<Vec<_>>(),
-        )?;
+        let purged = cache.retain_symbols(&trading)?;
+        let alive: Vec<&(String, Option<data::LotFilter>, i64)> = lots
+            .iter()
+            .filter(|(_, _, launch)| *launch <= last)
+            .collect();
+        cache.put_instruments(&alive.iter().map(|x| (*x).clone()).collect::<Vec<_>>())?;
         let (client, cache2) = (client, &cache);
-        let mut jobs = stream::iter(alive.iter().map(|(s, _)| s.clone()))
+        let mut jobs = stream::iter(alive.iter().map(|(s, _, _)| s.clone()))
             .map(|s| async move {
                 let since = cache2.bars_since(&s, first, last)?;
                 if since <= last {
@@ -56,7 +57,7 @@ async fn holdout(client: &Client, windows: &str) -> anyhow::Result<()> {
         }
         let (with_bars, _) = cache.contents()?;
         println!(
-            "holdout window {k}: {} symbols alive, {} with candles, {failed} failed",
+            "holdout window {k}: {} trading tokens listed by then, {} with candles, {purged} delisted or non-token purged, {failed} failed",
             alive.len(),
             with_bars.len()
         );
@@ -78,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         client.usdt_account(&creds).await?.wallet
     );
     let lots = client.usdt_perpetual_lots().await?;
+    let trading: HashSet<String> = lots.iter().map(|(s, _, _)| s.clone()).collect();
     let candidates = client
         .top_margin_tokens(&lots, walkforward::CANDIDATES)
         .await?;
@@ -95,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
     for k in 1..=3 {
         let (first, last) = research::window_bounds(k);
         let cache = Cache::open(research::window_file(&dir, k).to_str().unwrap_or_default())?;
+        let purged = cache.retain_symbols(&trading)?;
+        if purged > 0 {
+            println!("window {k}: {purged} delisted or non-token symbols purged");
+        }
         cache.put_rules(&rules)?;
         cache.put_instruments(&lots)?;
         cache.put_universe(&symbols)?;

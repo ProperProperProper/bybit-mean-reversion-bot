@@ -12,6 +12,7 @@
 //! * volatility_score / volume_score / pa_strength: percentiles within the universe.
 //! * rank_value = mean of those three; rank = position (1 = highest).
 //! * price_action_score = percentile of the signed price action (0 bearish .. 100 bullish).
+//! * return_score = percentile of the 24h return (0 biggest loser .. 100 biggest gainer).
 //! * trend_score = 50 + (price_action_score - 50) * rank_value/100, clamped to 1..100:
 //!   strongly directional only when the pair is also highly ranked.
 
@@ -37,6 +38,8 @@ pub struct Score {
     pub trend_score: f64,
     pub rsi14: f64,
     pub turnover_24h: f64,
+    /// Percentile (0-100) of the 24h return (96 bars) within the universe.
+    pub return_score: f64,
     /// Pulse score, 0-100: sigmoid(Z_v * V_R * D_M), V_R = BBW(15m)/BBW(4h),
     /// D_M = 1 + |slope%| in the side's direction else 0. Slope is the 5-bar OLS
     /// slope as % of price per bar (comparable across pairs); shorts mirror longs.
@@ -52,6 +55,7 @@ struct Raw {
     vol_z: f64,
     rsi: f64,
     turnover_24h: f64,
+    ret_24h: f64,
     pulse: Option<(f64, f64)>,
 }
 
@@ -119,6 +123,7 @@ fn raw_features(bars: &[Option<Bar>]) -> Vec<Option<Raw>> {
             100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
         };
         let turnover_24h = w(96).iter().map(|x| x.unwrap().turnover).sum::<f64>();
+        let ret_24h = b.close / bars[t - 96].unwrap().close - 1.0;
         let pulse = pulse_scores(bars, t, run_start, vol_z);
         out[t] = Some(Raw {
             vol,
@@ -126,6 +131,7 @@ fn raw_features(bars: &[Option<Bar>]) -> Vec<Option<Raw>> {
             vol_z,
             rsi,
             turnover_24h,
+            ret_24h,
             pulse,
         });
     }
@@ -191,8 +197,16 @@ fn percentile(sorted: &[f64], x: f64) -> f64 {
     }
 }
 
-/// Scores `[symbol][bar]`, None outside the universe or during warmup.
+/// Scores `[symbol][bar]`, None outside the universe or during warmup. Only
+/// symbols with Bybit rules (tradeable now) can join the universe.
 pub fn compute(m: &Market, universe: usize) -> Vec<Vec<Option<Score>>> {
+    compute_with(m, universe, true)
+}
+
+/// `compute`, optionally ranking every symbol that traded at the time whether
+/// or not it has rules today: research on the universe as it was then, free
+/// of today's survivors (`examples/signal_ic.rs`).
+pub fn compute_with(m: &Market, universe: usize, tradeable_only: bool) -> Vec<Vec<Option<Score>>> {
     let raws: Vec<Vec<Option<Raw>>> = m
         .bars
         .iter()
@@ -219,7 +233,9 @@ pub fn compute(m: &Market, universe: usize) -> Vec<Vec<Option<Score>>> {
                 if !m.entry_eligible.get(s).copied().unwrap_or(true) {
                     return None;
                 }
-                m.rules(s)?;
+                if tradeable_only {
+                    m.rules(s)?;
+                }
                 if let Some(launch) = m.listing_times.get(s).copied().flatten() {
                     let first_full = ((launch + crate::engine::BAR_MS - 1) / crate::engine::BAR_MS)
                         * crate::engine::BAR_MS;
@@ -240,11 +256,12 @@ pub fn compute(m: &Market, universe: usize) -> Vec<Vec<Option<Score>>> {
             v.sort_by(f64::total_cmp);
             v
         };
-        let (vols, zs, strengths, pas) = (
+        let (vols, zs, strengths, pas, rets) = (
             sorted(&|r| r.vol),
             sorted(&|r| r.vol_z),
             sorted(&|r| r.pa.abs()),
             sorted(&|r| r.pa),
+            sorted(&|r| r.ret_24h),
         );
         let mut scored: Vec<(usize, Score)> = members
             .iter()
@@ -268,6 +285,7 @@ pub fn compute(m: &Market, universe: usize) -> Vec<Vec<Option<Score>>> {
                         trend_score: (50.0 + (pas_ - 50.0) * rank_value / 100.0).clamp(1.0, 100.0),
                         rsi14: r.rsi,
                         turnover_24h: r.turnover_24h,
+                        return_score: percentile(&rets, r.ret_24h),
                         pulse_long: r.pulse.map(|p| p.0),
                         pulse_short: r.pulse.map(|p| p.1),
                     },

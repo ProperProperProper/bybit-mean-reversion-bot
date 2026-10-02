@@ -1,11 +1,11 @@
-//! Paper-trading service for the contrarian Pulse strategy (see
-//! walkforward::LIVE_SIGNAL for the evidence) — never places orders.
+//! Paper-trading service for the long-only "calm dip" strategy (see
+//! walkforward::live_grid) — never places orders.
 //!
-//! bar_task (each 15m close): sync closed bars + funding for every USDT
-//! perpetual -> scores (top-50 universe by 24h turnover) -> 14-day
-//! walk-forward -> step the persisted paper portfolio through every new bar
-//! with the chosen params (missed bars replayed in order) -> publish the
-//! current LONG (most bearish Pulse) / SHORT (most bullish Pulse) targets.
+//! bar_task (each 15m close): sync closed bars + funding for the universe
+//! (top 50 USDT perpetuals by 24h turnover with complete rules) -> scores ->
+//! 14-day walk-forward -> step the persisted paper portfolio through every new
+//! bar with the chosen params (missed bars replayed in order) -> publish the
+//! current LONG targets (calmest coins that fell most over 24h).
 //! Console: 127.0.0.1:8787 (`/`, `/api/status`, `/api/signals`, `/api/research`),
 //! polled by the page (no WebSocket).
 
@@ -32,7 +32,8 @@ const PAPER_FILE: &str = "paper_xs.json";
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalRow {
     pub symbol: String,
-    /// Ranking value of the live signal (Pulse: pulse_long - pulse_short).
+    /// Ranking value of the live signal (CalmDip: mean of the volatility and
+    /// 24h-return percentiles; lowest is bought).
     pub signal: f64,
     /// 1 = lowest value (long side).
     pub rank: usize,
@@ -288,7 +289,7 @@ impl App {
 }
 
 pub async fn serve(dir: PathBuf) -> Result<()> {
-    info!("Bybit Mean Reversion Bot — contrarian Pulse, market-neutral (paper + signals only): 15m bars, top {} USDT perps, 14-day walk-forward, CPU target {}%",
+    info!("Bybit Mean Reversion Bot — long-only calm dip (paper + signals only): 15m bars, top {} USDT perps, 14-day walk-forward, CPU target {}%",
         walkforward::UNIVERSE, governor::CPU_TARGET_PCT);
     governor::global();
     let paper = load_paper(&dir.join(PAPER_FILE))?;
@@ -311,7 +312,7 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
         dir,
         health: health.clone(),
         status: RwLock::new(Status {
-            strategy: "Contrarian Pulse: short the strongest bullish Pulse, long the strongest bearish Pulse, market-neutral (paper only)".into(),
+            strategy: "Long only, calm dip: buy the calmest coins that fell most over 24h, optional BTC trend filter (paper only)".into(),
             started_ms: chrono::Utc::now().timestamp_millis(),
             universe: walkforward::UNIVERSE,
             ..Default::default()
@@ -857,18 +858,18 @@ const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(
 ['Walk-forward',s.report?'<span class='+(s.validated?'ok':s.mode==='FORWARD TEST'?'warn':'bad')+'>'+s.mode+'</span>':'…'],
 ['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
 ['Tasks',Object.entries(s.tasks||{}).map(([k,v])=>k+(v.running?' ✓':' ✗')).join(' ')]];
-document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+' most bearish Pulse, short the '+s.effective_pairs+' most bullish, among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
+document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+' lowest calm-dip scores (calm and down over 24h), among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
 document.getElementById('cards').innerHTML=cards.map(c=>`<div class=card><span class=k>${c[0]}</span><b>${c[1]}</b></div>`).join('');
 document.getElementById('nextreb').textContent=s.next_rebalance_ts?'next rebalance at '+t(s.next_rebalance_ts)+(s.params?' (every '+s.params.hold*15+' min)':''):'';
 document.getElementById('pos').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Mark<th>P&L USDT (after its fees + funding)<th>P&L % (margin)<th>Stop<th>Lev<th>Opened</tr>'+(s.paper_positions||[]).map(p=>{
  const u=pu(p),pl=u/p.margin*100;return `<tr><td>${p.symbol}<td class=${p.side}>${p.side}<td>${p.entry}<td>${p.mark}<td class=${u>=0?"ok":"bad"}>${sg(u)}<td class=${u>=0?"ok":"bad"}>${pc(pl)}<td>${f(p.stop,6)}<td>${f(p.leverage,1)}<td>${t(p.entry_ts)}</tr>`}).join('');
 const tg=g.filter(r=>r.target||r.held);
-document.getElementById('sig').innerHTML='<tr><th>Symbol<th>Target<th>Held<th>Pulse long−short<th>Rank (1 = most bearish)<th>Close<th>24h turnover</tr>'+
+document.getElementById('sig').innerHTML='<tr><th>Symbol<th>Target<th>Held<th>Calm-dip score<th>Rank (1 = bought first)<th>Close<th>24h turnover</tr>'+
 tg.map(r=>`<tr><td>${r.symbol}<td class=${r.target||''}>${r.target||'-'}<td class=${r.held||''}>${r.held||'-'}<td>${f(r.signal)}<td>${r.rank}<td>${r.close}<td>${f(r.turnover_24h/1e6,1)}M</tr>`).join('');
 document.getElementById('ev').textContent=(s.events||[]).join('\n');
 document.getElementById('tr').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Exit<th>P&L USDT<th>P&L % (margin)<th>Reason<th>Closed</tr>'+(s.paper_recent_trades||[]).map(x=>`<tr><td>${x.symbol}<td class=${x.side}>${x.side}<td>${x.entry}<td>${x.exit}<td class=${x.pnl>=0?"ok":"bad"}>${sg(x.pnl)}<td class=${x.pnl>=0?"ok":"bad"}>${pc(x.r*100)}<td>${x.reason}<td>${t(x.exit_ts)}</tr>`).join('');
 const r=s.report||{},o=r.oos||{},full=r.full_period||{},eq0=r.start_equity||1,on=(o.end_equity||0)-(o.start_equity||0);
-const desc=p=>p?`${p.signal}${p.signal==='Return'?' over '+p.lookback*15/60+'h':''} ${p.flip?'(follow)':'(contrarian)'}: long the ${p.top} lowest, short the ${p.top} highest, rebalance every ${p.hold*15/60}h, ${p.gross_leverage}x, stop ${p.stop_pct==null?'none':p.stop_pct+'%'}`:'none';
+const desc=p=>p?`${p.signal}${p.signal==='Return'?' over '+p.lookback*15/60+'h':''} ${p.flip?'(follow)':'(contrarian)'}: ${p.long_only?'long the '+p.top+' lowest only':'long the '+p.top+' lowest, short the '+p.top+' highest'}${p.regime==='BtcTrend'?', only while BTC is above its 24h average':''}, rebalance every ${p.hold*15/60}h, ${p.gross_leverage}x, stop ${p.stop_pct==null?'none':p.stop_pct+'%'}`:'none';
 const wn=w=>w.out_of_sample?w.out_of_sample.end_equity-w.out_of_sample.start_equity:null;
 document.getElementById('wf').textContent=r.windows?`verdict: ${r.passed?'PASSED':(s.mode==='FORWARD TEST'?'FORWARD TEST — not validated, paper trades to gather evidence':'FAILED — no new positions')}${r.reasons&&r.reasons.length?'\nwhy: '+r.reasons.join('; '):''}
 settings now: ${desc(r.params)}
@@ -973,6 +974,8 @@ mod causal_tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: xs::Risk::default(),
+            long_only: false,
+            regime: xs::Regime::Off,
         };
         let mut next = old.clone();
         next.hold = 4;

@@ -1,6 +1,6 @@
 # `src/engine/xs.rs`: the strategy engine
 
-A cross-sectional, market-neutral portfolio over the top-50 token USDT perpetuals. At aligned rebalance closes it ranks the universe by a `Signal`, then holds **long the `top` lowest values and short the `top` highest**, equal notional per leg. The same `step` function drives backtests, the walk-forward and paper trading, so there is no separate "live logic". Audit history: [audit.md](audit.md).
+A cross-sectional portfolio over the top-50 token USDT perpetuals. At aligned rebalance closes it ranks the universe by a `Signal`, then holds **long the `top` lowest values**, plus, unless `long_only`, **short the `top` highest** (market-neutral), equal notional per leg. The live strategy is long only. The same `step` function drives backtests, the walk-forward and paper trading, so there is no separate "live logic". Audit history: [audit.md](audit.md).
 
 ## Constants
 
@@ -19,8 +19,9 @@ A cross-sectional, market-neutral portfolio over the top-50 token USDT perpetual
 | `PriceAction` | Percentile of signed price action (0 bearish … 100 bullish) | Long the most bearish |
 | `Volatility` | Screener volatility score | Long low volatility |
 | `Rsi` | RSI(14) | Long oversold |
-| `Pulse` | `pulse_long − pulse_short` | **Contrarian Pulse (live family):** long the most bearish, short the most bullish |
+| `Pulse` | `pulse_long − pulse_short` | Contrarian: long the most bearish |
 | `Funding` | Average hourly rate of the last 3 settled fundings | Carry: long negative, short positive |
+| `CalmDip` | Mean of the volatility and 24h-return percentiles | **Live:** long the calmest coins that fell most over 24h |
 
 `flip` reverses the direction.
 
@@ -35,6 +36,12 @@ A cross-sectional, market-neutral portfolio over the top-50 token USDT perpetual
 | `gross_leverage` | Leverage of each position |
 | `stop_pct` | Optional intrabar stop (% against entry) |
 | `risk` | Drawdown rules (`Risk`), all off by default |
+| `long_only` | Hold only the long side (`slots()` = `top` instead of `2 × top`); the neutrality check is skipped, all legs must still fill |
+| `regime` | Entry filter (`Regime`) |
+
+## `enum Regime` and `regime_allows(m, t, r)`
+
+`Off`, or `BtcTrend`: entries only while BTCUSDT's close is above its average close over the last `REGIME_BARS` (96 bars = 24h). When it blocks at a rebalance close, the rebalance holds nothing (existing positions close as usual) and the allocation note says so. Missing BTC history blocks; nothing is assumed.
 
 ## `struct Risk`
 
@@ -75,7 +82,7 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 
 **`targets(m, scores, t, p)`:** the `top` lowest values long and the `top` highest short, ties broken by index.
 
-**`funded_targets` (private):** the decision used by the portfolio. Starting at `p.top` pairs and stepping down to 1, each slot gets `free × scale × 0.99 / (2 × pairs) / (1 + adds)`. A symbol is rankable at that slot only if its measured book can fill the order, Bybit's lot rules accept it, **rounding to the quantity step keeps at least 99% of the notional**, and the leverage is allowed by its tier. The first pair count where both sides fill wins. Returns nothing when the free balance is below `MIN_ENTRY_BALANCE`.
+**`funded_targets` (private):** the decision used by the portfolio. Starting at `p.top` per side and stepping down to 1, each slot gets `free × scale × 0.99 / slots / (1 + adds)`. A symbol is rankable at that slot only if its measured book can fill the order, Bybit's lot rules accept it, **rounding to the quantity step keeps at least 99% of the notional**, and the leverage is allowed by its tier. The first basket size where every slot fills wins. Returns nothing when the free balance is below `MIN_ENTRY_BALANCE`.
 
 ## Orders and accounting
 
@@ -91,7 +98,7 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 1. Every held position needs a mark candle at `t`, else `execution_error`.
 2. Funding stamped at this open is charged; then any position whose mark open is through its liquidation level is liquidated, **before** any queued action.
 3. Queued actions: breaker flatten, then per-position stop / take-profit / rebalance exit; an add only when no rebalance coincides and entries are allowed.
-4. Rebalance (if decided earlier and due): waits a bar if any target lacks data; otherwise closes every position, then opens all legs with the fixed slot budget on a copy. The copy replaces the account only if **every** leg filled and the sides are within `NEUTRAL_TOLERANCE`; otherwise `rejected_rebalances` += 1. No entries while the free balance is below the minimum.
+4. Rebalance (if decided earlier and due): waits a bar if any target lacks data; otherwise closes every position, then opens all legs with the fixed slot budget on a copy. The copy replaces the account only if **every** leg filled and (unless long only) the sides are within `NEUTRAL_TOLERANCE`; otherwise `rejected_rebalances` += 1. No entries while the free balance is below the minimum.
 5. Inside the bar: intrabar funding is refused (it needs finer mark data); mark-price liquidation (open or adverse extreme) first, then the traded-price stop; then the close-based rules queue the next action.
 6. Funding stamped at this bar's close is charged at the next bar's mark open. On the newest loaded bar it waits for that bar.
 7. Breaker check, then `decide_close`, then peak and drawdown.

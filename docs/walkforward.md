@@ -29,15 +29,15 @@ Then the **final settings** are chosen on the most recent 8 days. Those are what
 
 Score used to pick settings in-sample: `return % − 0.5 × max drawdown %`. It rewards return but penalises the path.
 
-## `LIVE_SIGNAL`, `live_grid()`
+## `live_grid()`
 
-The current paper strategy family is `Signal::Pulse`. Previous selection results are withdrawn pending corrected accounting and independent validation.
+Long only, `Signal::CalmDip` unflipped (the direction comes from the full-universe signal study, `examples/signal_ic.rs`, not from P&L). The walk-forward picks among 32 combinations: hold 32 or 96 bars, 3 or 5 coins, 1× or 2×, no stop or a 10% stop, BTC trend filter off or on.
 
-`live_grid()` is that family's grid with no drawdown rule (`examples/risk_variants.rs` compares alternatives).
+## Grids
 
-## `XS_SIGNALS`, `xs_grid()`, `xs_family_grid(signal)`
-
-All seven ranking signals, the grid over all of them, and the grid for one signal family:
+- `XS_SIGNALS`: all eight ranking signals.
+- `long_grid()` / `long_family_grid(signal)`: long only, both directions, hold 16/32/96, 3 or 5 coins, 1× or 2×, stop none or 10%, regime off or BTC trend (96 per signal, 192 for `Return`).
+- `xs_grid()` / `xs_family_grid(signal)`: market-neutral research grids:
 
 | Setting | Options |
 |---|---|

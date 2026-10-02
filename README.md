@@ -2,14 +2,14 @@
 
 A Rust paper-trading and research service for Bybit USDT perpetuals. It reads real exchange data: closed traded and mark-price candles, settled funding, instrument filters, margin tiers, this account's fees and wallet, and current order books. **It never places orders.**
 
-**Status (2 October 2026):** every accounting, data and recovery defect found so far is fixed, with regression tests ([audit](docs/audit.md)). With those fixes, the live strategy **fails** its walk-forward on all four real 14-day data sets, and no other signal family holds up either ([validation](docs/validation.md)). The paper account therefore stays flat until a strategy passes.
+**Status (2 October 2026):** every accounting, data and recovery defect found so far is fixed, with regression tests ([audit](docs/audit.md)). The strategy is now **long only** with an evidence-based entry signal; it passes its walk-forward on 1 of 4 real 14-day data sets and trails buy-and-hold of the universe, so it is not a proven edge ([validation](docs/validation.md)). Paper trades only while the walk-forward gate allows. Agents: read [AGENTS.md](AGENTS.md).
 
 ## Strategy
 
 - **Universe:** the top 50 token USDT perpetuals on Bybit by 24-hour turnover **that have complete Bybit rules** (margin tiers, account fee, lot filter, measured order book). The top 75 are measured hourly; a coin missing any of that is dropped and the next one by turnover takes its place. Stock, ETF, forex and commodity contracts, delistings and pre-listings are excluded.
-- **Signal (live family):** contrarian Pulse. Long the most bearish, short the most bullish, equal notional per leg, market-neutral within 2%.
-- **Settings:** chosen every bar by a 14-day walk-forward from 48 combinations: either direction, 5 or 10 pairs, 4/8/24-hour rebalances, 1× or 2× leverage, no stop or a 20% stop.
-- **Balance-aware sizing:** pairs are funded from the free balance, i.e. the wallet minus margin committed anywhere on the account (other positions, orders, locks). Smaller balances use fewer pairs; a contract whose lot step would unbalance the basket is left out at that size. Below **5 USDT free, nothing is opened or added**; exits continue.
+- **Long only.** Entry signal `CalmDip`: buy the calmest coins that fell most over the last 24 hours (mean of the volatility and 24h-return percentiles). On the full historical universe both effects held in every research window ([validation](docs/validation.md)); it is still unproven on new data.
+- **Settings:** chosen every bar by a 14-day walk-forward from 32 combinations: 8 or 24-hour holds, 3 or 5 coins, 1× or 2× leverage, no stop or a 10% stop, and an optional BTC trend filter (enter only while BTC is above its 24-hour average).
+- **Balance-aware sizing:** pairs are funded from the free balance, i.e. the wallet minus margin committed anywhere on the account (other positions, orders, locks). Smaller balances use fewer coins; a contract whose lot step would distort its slot is left out at that size. Below **5 USDT free, nothing is opened or added**; exits continue.
 - **Execution model:** decided at a 15-minute close, filled at the next open at the measured order-book cost, with this account's taker fee, Bybit lot rounding and tier leverage limits. A rebalance fills all legs or none. Funding is valued at the mark price and drawn from free cash, then isolated margin. Liquidation triggers on mark-price extremes, using real tiers and deductions.
 
 ## Validation gate

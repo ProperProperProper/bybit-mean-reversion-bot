@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
     let all = Market::concat(&markets)?;
     let sc_all = scores::compute(&all, walkforward::UNIVERSE);
     // The plain family grid; each variant sets its own drawdown rule.
-    let live = walkforward::xs_family_grid(walkforward::LIVE_SIGNAL);
+    let live = walkforward::live_grid();
     let none = Risk::default();
     let variants: Vec<(&str, Risk, bool)> = vec![
         ("no drawdown rule (live)", none, false),

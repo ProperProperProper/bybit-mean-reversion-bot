@@ -68,6 +68,7 @@ Tests: `no_entries_or_adds_below_the_free_balance_floor`, `account_balance_reser
 
 ## Known limitations (not defects)
 
+- **Survivorship bias in the research windows.** `window_k.db` holds today's top-50 coins only, which favours coins that recently rallied. Long-only backtests on those windows are inflated; entry evidence comes from `signal_ic` on the full historical universe (backup windows with every perpetual that traded then).
 - **No independent holdout.** The research windows were also used to choose the strategy family. Only data that arrives after a frozen procedure is an untouched test.
 - **Historical execution uses today's measurements.** Order books, fees and risk tiers are current measurements applied to past bars; Bybit publishes no historical books.
 - **Results are noise-sensitive at this balance.** With 11–22 USDT slots, small sizing differences change which coins pass the lot checks; doubling costs can change the selected coins and with them the result. Single-coin moves (squeezes of +50% to +100%) dominate the outcomes.

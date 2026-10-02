@@ -1,6 +1,6 @@
 # `src/engine/scores.rs`: the screener
 
-Status (2 October 2026): `price_action_score` is the percentile of signed price action, and the `PriceAction` signal ranks it. `pa_strength` (unsigned) only feeds the activity rank.
+Status (2 October 2026): `price_action_score` is the percentile of signed price action, and the `PriceAction` signal ranks it. `pa_strength` (unsigned) only feeds the activity rank. `return_score` is the percentile of the 24h return (used by `CalmDip`). `compute_with(m, universe, false)` ranks every symbol that traded at the time, not only today's tradeable ones, for survivorship-free research.
 
 Scores every symbol on every closed 15-minute bar. **Everything at bar `t` uses bars ≤ `t` only**, and cross-sectional parts compare a symbol with the other symbols at the same bar. Tests check that scores don't change when later bars are removed or altered.
 

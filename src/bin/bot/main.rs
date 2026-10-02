@@ -1,4 +1,4 @@
-//! Bybit Mean Reversion Bot: contrarian Pulse cross-sectional strategy on Bybit USDT perps
+//! Bybit Mean Reversion Bot: long-only "calm dip" strategy on Bybit USDT perps
 //! (paper + signals only; never places orders).
 //!
 //!   bot backtest     sync real data and print the live strategy's 14-day walk-forward

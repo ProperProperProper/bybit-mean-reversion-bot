@@ -28,11 +28,53 @@ fn main() -> anyhow::Result<()> {
     // across window edges (as live); settings are still chosen per 14-day window.
     let all = Market::concat(&markets)?;
     let sc_all = scores::compute(&all, walkforward::UNIVERSE);
+    // Long-only families (the live mode) by default; NEUTRAL=1 compares the
+    // market-neutral families instead.
+    let neutral = std::env::var("NEUTRAL").is_ok();
     let mut families: Vec<(String, Vec<xs::XsParams>)> = walkforward::XS_SIGNALS
         .iter()
-        .map(|&s| (format!("{s:?}"), walkforward::xs_family_grid(s)))
+        .map(|&s| {
+            let grid = if neutral {
+                walkforward::xs_family_grid(s)
+            } else {
+                walkforward::long_family_grid(s)
+            };
+            (format!("{s:?}"), grid)
+        })
         .collect();
-    families.push(("ALL".into(), walkforward::xs_grid()));
+    families.push((
+        "ALL".into(),
+        if neutral {
+            walkforward::xs_grid()
+        } else {
+            walkforward::long_grid()
+        },
+    ));
+    // Buy-and-hold references for each traded window: BTC alone, and every
+    // coin of the window's universe equally weighted (open of the first bar to
+    // close of the last, no costs).
+    for (k, window) in markets.iter().enumerate().skip(1) {
+        let range = k * BARS..(k + 1) * BARS;
+        let hold = |s: usize| -> Option<f64> {
+            Some(all.bars[s][range.end - 1]?.close / all.bars[s][range.start]?.open - 1.0)
+        };
+        let btc = all
+            .symbols
+            .iter()
+            .position(|x| x == "BTCUSDT")
+            .and_then(hold);
+        let eq_weight: Vec<f64> = (0..all.symbols.len())
+            .filter(|&s| window.symbols.contains(&all.symbols[s]))
+            .filter_map(hold)
+            .collect();
+        println!(
+            "buy and hold W{}: BTC {:+.1}%  equal-weight universe {:+.1}% ({} coins)",
+            k + 1,
+            btc.map_or(f64::NAN, |r| r * 100.0),
+            eq_weight.iter().sum::<f64>() / eq_weight.len().max(1) as f64 * 100.0,
+            eq_weight.len()
+        );
+    }
 
     for (name, grid) in &families {
         let started = Instant::now();
@@ -77,9 +119,9 @@ fn main() -> anyhow::Result<()> {
                 .metrics();
             let b = xs::backtest_costs(&all, &sc_all, (k + 1) * BARS..(k + 2) * BARS, p, eq, 2.0)
                 .metrics();
-            println!("  forward W{}->W{}: net {:+6.1}% (2x costs {:+6.1}%)  PF {:5.2}  trades {:4}  maxDD {:5.1}%  liq {}  | {:?} flip {} lb {} hold {} top {} lev {} stop {:?}",
+            println!("  forward W{}->W{}: net {:+6.1}% (2x costs {:+6.1}%)  PF {:5.2}  trades {:4}  maxDD {:5.1}%  liq {}  | {:?} flip {} lb {} hold {} top {} lev {} stop {:?} {:?}",
                 k + 1, k + 2, a.return_pct(), b.return_pct(), a.profit_factor(), a.trades, a.max_drawdown_pct, a.liquidations,
-                p.signal, p.flip, p.lookback, p.hold, p.top, p.gross_leverage, p.stop_pct);
+                p.signal, p.flip, p.lookback, p.hold, p.top, p.gross_leverage, p.stop_pct, p.regime);
         }
     }
     Ok(())

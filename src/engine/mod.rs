@@ -7,8 +7,9 @@
 //!   fee, margin tiers and the measured order-book cost of each order size.
 //! * `scores` — the screener: volatility, price action, volume, activity rank,
 //!   trend score and Pulse, computed causally from closed bars.
-//! * `xs` — the strategy: cross-sectional, market-neutral ranking (live:
-//!   contrarian Pulse, `walkforward::LIVE_SIGNAL`), with optional drawdown rules.
+//! * `xs` — the strategy: cross-sectional ranking, market-neutral or long only
+//!   (live: long-only `Signal::CalmDip`, `walkforward::live_grid`), with an
+//!   optional BTC trend filter and drawdown rules.
 //! * `walkforward` — the 14-day walk-forward gate and the strategy grids.
 //! * `metrics` — trade records and performance metrics.
 //! * `research` — the three fixed 14-day research windows and research start equity.

@@ -43,6 +43,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_grid_is_long_only_calm_dip() {
+        let g = live_grid();
+        assert_eq!(g.len(), 32);
+        assert!(g
+            .iter()
+            .all(|p| p.long_only && !p.flip && p.signal == Signal::CalmDip));
+    }
+
+    #[test]
     fn windows_fit_14_days() {
         assert_eq!(BARS, 1344);
         assert_eq!(WINDOW_STARTS[2] + IS_BARS + OOS_BARS, BARS);
@@ -118,20 +127,22 @@ mod tests {
 
 // ---------------------------------------------------------------- cross-sectional (xs)
 
-use super::xs::{self, Signal, XsParams};
+use super::xs::{self, Regime, Signal, XsParams};
 
-/// The current paper strategy family. Historical selection results must be
-/// rerun after accounting/data fixes; this constant is not a profitability claim.
-pub const LIVE_SIGNAL: Signal = Signal::Pulse;
-
-/// Current paper grid without an optional drawdown rule. Use the research
-/// examples to compare alternatives on corrected accounting and untouched data.
+/// The paper strategy: long only, buying calm dips (`Signal::CalmDip`
+/// unflipped: the direction comes from the full-universe signal study in
+/// examples/signal_ic.rs, not from P&L). The walk-forward picks the hold,
+/// basket size, leverage, stop and BTC filter. Not a profitability claim
+/// (see docs/validation.md).
 pub fn live_grid() -> Vec<XsParams> {
-    xs_family_grid(LIVE_SIGNAL)
+    long_family_grid(Signal::CalmDip)
+        .into_iter()
+        .filter(|p| !p.flip && p.hold >= 32)
+        .collect()
 }
 
-/// Every ranking signal (screener scores, return, funding) in both directions.
-pub const XS_SIGNALS: [Signal; 7] = [
+/// Every ranking signal (screener scores, return, funding).
+pub const XS_SIGNALS: [Signal; 8] = [
     Signal::Return,
     Signal::TrendScore,
     Signal::PriceAction,
@@ -139,24 +150,70 @@ pub const XS_SIGNALS: [Signal; 7] = [
     Signal::Rsi,
     Signal::Pulse,
     Signal::Funding,
+    Signal::CalmDip,
 ];
 
+/// Lookbacks searched: only `Return` uses one.
+fn lookbacks(signal: Signal) -> &'static [usize] {
+    if signal == Signal::Return {
+        &[16, 96]
+    } else {
+        &[0]
+    }
+}
+
+/// Long-only grid over every signal.
+pub fn long_grid() -> Vec<XsParams> {
+    XS_SIGNALS
+        .iter()
+        .flat_map(|&s| long_family_grid(s))
+        .collect()
+}
+
+/// Long-only grid for one entry signal: unflipped buys the lowest values
+/// (contrarian), flipped the highest (momentum). 3 or 5 coins, a 10% stop or
+/// none, the BTC trend filter off or on.
+pub fn long_family_grid(signal: Signal) -> Vec<XsParams> {
+    let mut out = Vec::new();
+    for flip in [false, true] {
+        for &lookback in lookbacks(signal) {
+            for hold in [16usize, 32, 96] {
+                for top in [3usize, 5] {
+                    for gross_leverage in [1.0, 2.0] {
+                        for stop_pct in [None, Some(10.0)] {
+                            for regime in [Regime::Off, Regime::BtcTrend] {
+                                out.push(XsParams {
+                                    signal,
+                                    flip,
+                                    lookback,
+                                    hold,
+                                    top,
+                                    gross_leverage,
+                                    stop_pct,
+                                    risk: Default::default(),
+                                    long_only: true,
+                                    regime,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Market-neutral grid over every signal (research comparison).
 pub fn xs_grid() -> Vec<XsParams> {
     XS_SIGNALS.iter().flat_map(|&s| xs_family_grid(s)).collect()
 }
 
-/// Grid for one signal family (what research and the live service search);
-/// lookback only varies where the signal uses it. Drawdown handling (`Risk`)
-/// is off: examples/risk_variants.rs compares the options.
+/// Market-neutral grid for one signal family (research comparison).
 pub fn xs_family_grid(signal: Signal) -> Vec<XsParams> {
-    let lookbacks: &[usize] = if signal == Signal::Return {
-        &[16, 96]
-    } else {
-        &[0]
-    };
     let mut out = Vec::new();
     for flip in [false, true] {
-        for &lookback in lookbacks {
+        for &lookback in lookbacks(signal) {
             for hold in [16usize, 32, 96] {
                 for top in [5usize, 10] {
                     for gross_leverage in [1.0, 2.0] {
@@ -170,6 +227,8 @@ pub fn xs_family_grid(signal: Signal) -> Vec<XsParams> {
                                 gross_leverage,
                                 stop_pct,
                                 risk: Default::default(),
+                                long_only: false,
+                                regime: Regime::Off,
                             });
                         }
                     }

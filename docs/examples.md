@@ -23,7 +23,11 @@ Signal research, from the real balance (or `EQ=…`).
 2. Runs each of the seven signal families, and all of them together, through the **14-day walk-forward in every window**. It prints the verdict, out-of-sample net, profit factor, trades and liquidations.
 3. Runs **two 14-day forward tests**: settings chosen at the end of window k trade window k+1, at real and at 2x costs.
 
-Set `EQ=` to the observed balance to run without network access. A family has to pass in all three windows and in both forward tests to count; none currently does.
+Long-only families by default (`NEUTRAL=1` for the market-neutral ones), plus buy-and-hold references (BTC and the equal-weight universe) for each traded window. Set `EQ=` to the observed balance to run without network access. The windows hold today's top coins, so long-only results there are biased upwards; use `signal_ic` on the full universe for entry evidence.
+
+## `signal_ic.rs`: entry-signal study
+
+`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory whose `window_1..3.db` hold candles for **every** perpetual that traded then; the universe is then the top 50 by turnover at each bar, which avoids the bias towards today's top coins. No network.
 
 ## `risk_variants.rs`: `main()`
 

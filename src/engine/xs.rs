@@ -43,6 +43,10 @@ pub enum Signal {
     /// Average hourly funding rate of the last 3 settlements (unflipped = carry:
     /// long the most negative, short the most positive, paid on both legs).
     Funding,
+    /// Mean of the volatility and 24h-return percentiles (unflipped = long the
+    /// calmest coins that fell most). Both effects held in every research
+    /// window on the full historical universe (examples/signal_ic.rs).
+    CalmDip,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +67,56 @@ pub struct XsParams {
     /// Drawdown handling (all off by default; see `Risk`).
     #[serde(default)]
     pub risk: Risk,
+    /// Long only: hold the `top` lowest values (after `flip`), never short.
+    #[serde(default)]
+    pub long_only: bool,
+    /// Entry filter: new positions only while it allows (see `Regime`).
+    #[serde(default)]
+    pub regime: Regime,
+}
+
+/// Market filter on entries, decided at the rebalance close. When it blocks,
+/// the rebalance holds nothing (existing positions are closed as usual).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Regime {
+    #[default]
+    Off,
+    /// BTCUSDT closes above its average close of the last `REGIME_BARS` bars.
+    BtcTrend,
+}
+
+/// 24 hours of 15m bars: the BTC trend filter's averaging window.
+pub const REGIME_BARS: usize = 96;
+
+/// Whether `r` allows entries at bar t. A missing BTC history blocks entries.
+pub fn regime_allows(m: &Market, t: usize, r: Regime) -> bool {
+    match r {
+        Regime::Off => true,
+        Regime::BtcTrend => {
+            let Some(btc) = m.symbols.iter().position(|s| s == "BTCUSDT") else {
+                return false;
+            };
+            if t + 1 < REGIME_BARS {
+                return false;
+            }
+            let closes: Option<Vec<f64>> = (t + 1 - REGIME_BARS..=t)
+                .map(|i| m.bars[btc][i].map(|b| b.close))
+                .collect();
+            closes.is_some_and(|c| c[c.len() - 1] > c.iter().sum::<f64>() / c.len() as f64)
+        }
+    }
+}
+
+impl XsParams {
+    /// Positions held at a full rebalance: `top` longs, plus `top` shorts
+    /// unless long only.
+    pub fn slots(&self) -> usize {
+        if self.long_only {
+            self.top
+        } else {
+            2 * self.top
+        }
+    }
 }
 
 /// Drawdown handling, each rule decided on a 15m CLOSE and executed at the
@@ -253,6 +307,7 @@ pub fn signal_value(
         Signal::Rsi => sc.rsi14,
         Signal::Pulse => sc.pulse_long? - sc.pulse_short?,
         Signal::Funding => funding_hourly(&m.funding[s], m.ts[t])?,
+        Signal::CalmDip => (sc.volatility_score + sc.return_score) / 2.0,
     };
     v.is_finite().then_some(if p.flip { -v } else { v })
 }
@@ -308,13 +363,15 @@ fn ranked_targets(
     for &(s, _) in &ranked[..p.top] {
         out.insert(s, Side::Long);
     }
-    for &(s, _) in &ranked[ranked.len() - p.top..] {
-        out.insert(s, Side::Short);
+    if !p.long_only {
+        for &(s, _) in &ranked[ranked.len() - p.top..] {
+            out.insert(s, Side::Short);
+        }
     }
     out
 }
 
-/// Reduce pair count until the balance can fund the contracts' actual lot rules.
+/// Reduce the basket until the balance can fund the contracts' actual lot rules.
 fn funded_targets(
     m: &Market,
     scores: &[Vec<Option<Score>>],
@@ -331,9 +388,9 @@ fn funded_targets(
     for top in (1..=p.top.min(m.symbols.len() / 2)).rev() {
         let mut adaptive = p.clone();
         adaptive.top = top;
-        let budget = equity * scale * SLOT_HEADROOM / (2 * top) as f64 / adds;
+        let budget = equity * scale * SLOT_HEADROOM / adaptive.slots() as f64 / adds;
         let target = ranked_targets(m, scores, t, &adaptive, Some((budget, cost_mult)));
-        if target.len() == 2 * top {
+        if target.len() == adaptive.slots() {
             return (target, top, budget);
         }
     }
@@ -821,7 +878,7 @@ impl XsPortfolio {
                     let gross = long + short;
                     if candidate.positions.len() == target.len()
                         && gross > 0.0
-                        && (long - short).abs() / gross <= NEUTRAL_TOLERANCE
+                        && (p.long_only || (long - short).abs() / gross <= NEUTRAL_TOLERANCE)
                     {
                         *self = candidate;
                     } else {
@@ -967,7 +1024,8 @@ impl XsPortfolio {
                 } else {
                     1.0
                 };
-            let (target, top, slot) = if self.entries_allowed {
+            let regime = regime_allows(m, t, p.regime);
+            let (target, top, slot) = if self.entries_allowed && regime {
                 funded_targets(m, scores, t, p, usable, self.cost_mult, scale)
             } else {
                 (BTreeMap::new(), 0, 0.0)
@@ -976,17 +1034,19 @@ impl XsPortfolio {
             self.pending_slot = slot;
             self.allocation_note = if !self.entries_allowed {
                 "entry gate disabled".into()
+            } else if !regime {
+                "regime filter: BTC below its 24h average, no entries".into()
             } else if usable < MIN_ENTRY_BALANCE {
                 format!("free balance {usable:.2} USDT below the {MIN_ENTRY_BALANCE} USDT minimum: no entries")
             } else if top == 0 {
-                "balance, minimum orders or measured liquidity cannot fund a neutral pair".into()
+                "balance, minimum orders or measured liquidity cannot fund the basket".into()
             } else if top < p.top {
                 format!(
-                    "balance-adjusted basket: {top} pairs (configured maximum {})",
+                    "balance-adjusted basket: {top} per side (configured maximum {})",
                     p.top
                 )
             } else {
-                format!("{top} funded pairs")
+                format!("{top} funded per side")
             };
             let mut execution = p.clone();
             if top > 0 {
@@ -1009,7 +1069,7 @@ impl XsPortfolio {
         t: usize,
         p: &XsParams,
     ) -> BTreeMap<usize, Side> {
-        if !self.entries_allowed {
+        if !self.entries_allowed || !regime_allows(m, t, p.regime) {
             return BTreeMap::new();
         }
         funded_targets(
@@ -1439,6 +1499,8 @@ mod tests {
             gross_leverage: 2.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         for equity in [0.1, 1.0, 10.0, 100.0, 1000.0, 1_000_000.0] {
             let mut pf = XsPortfolio::new(equity);
@@ -1491,6 +1553,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         // 100 USDT wallet, 96 committed to other positions: 4 free, no trade.
         let mut pf = XsPortfolio::new(100.0);
@@ -1551,6 +1615,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let mut pf = XsPortfolio::new(300.0);
         pf.decide_close(&m, &scores, 175, &p);
@@ -1567,6 +1633,86 @@ mod tests {
         };
         let (l, sh) = (side(Side::Long), side(Side::Short));
         assert!((l - sh).abs() / (l + sh) <= NEUTRAL_TOLERANCE);
+    }
+
+    fn long_params(flip: bool, regime: Regime) -> XsParams {
+        XsParams {
+            signal: Signal::Return,
+            flip,
+            lookback: 16,
+            hold: 16,
+            top: 3,
+            gross_leverage: 1.0,
+            stop_pct: None,
+            risk: Risk::default(),
+            long_only: true,
+            regime,
+        }
+    }
+
+    #[test]
+    fn long_only_buys_the_ranked_end_and_never_shorts() {
+        // Symbol s drifts by (s - 5.5): 0..5 fall, 6..11 rise.
+        let series: Vec<Vec<f64>> = (0..12)
+            .map(|s| {
+                (0..200)
+                    .map(|t| 100.0 + (s as f64 - 5.5) * t as f64 * 0.0001)
+                    .collect()
+            })
+            .collect();
+        let m = market(&series);
+        let scores = sc(&m);
+        for (flip, expected) in [(false, [0, 1, 2]), (true, [9, 10, 11])] {
+            let p = long_params(flip, Regime::Off);
+            let mut pf = XsPortfolio::new(300.0);
+            pf.decide_close(&m, &scores, 175, &p);
+            pf.step(&m, &scores, 176, &p);
+            assert_eq!(pf.rejected_rebalances, 0);
+            let mut held: Vec<usize> = pf.positions.iter().map(|x| x.sym).collect();
+            held.sort();
+            assert_eq!(held, expected, "flip {flip}");
+            assert!(pf.positions.iter().all(|x| x.side == Side::Long));
+            // Each of the 3 slots gets a third of 99% of the balance.
+            for x in &pf.positions {
+                assert!((x.margin + x.fees - 300.0 * SLOT_HEADROOM / 3.0).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn btc_trend_filter_blocks_entries_below_its_24h_average() {
+        let rising: Vec<f64> = (0..200).map(|t| 100.0 + t as f64 * 0.01).collect();
+        let falling: Vec<f64> = (0..200).map(|t| 100.0 - t as f64 * 0.01).collect();
+        for (btc, allowed) in [(rising, true), (falling, false)] {
+            let mut series: Vec<Vec<f64>> = (0..12)
+                .map(|s| {
+                    (0..200)
+                        .map(|t| 100.0 + (s as f64 - 5.5) * t as f64 * 0.0001)
+                        .collect()
+                })
+                .collect();
+            series[11] = btc;
+            let mut m = market(&series);
+            m.symbols[11] = "BTCUSDT".into();
+            let scores = sc(&m);
+            assert_eq!(regime_allows(&m, 175, Regime::BtcTrend), allowed);
+            let p = long_params(false, Regime::BtcTrend);
+            let mut pf = XsPortfolio::new(300.0);
+            pf.decide_close(&m, &scores, 175, &p);
+            pf.step(&m, &scores, 176, &p);
+            assert_eq!(pf.positions.len(), if allowed { 3 } else { 0 });
+            if !allowed {
+                assert!(
+                    pf.allocation_note.contains("BTC below"),
+                    "{}",
+                    pf.allocation_note
+                );
+            }
+        }
+        // Without BTC history the filter never guesses: no entries.
+        let m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        assert!(!regime_allows(&m, 150, Regime::BtcTrend));
+        assert!(regime_allows(&m, 150, Regime::Off));
     }
 
     #[test]
@@ -1698,6 +1844,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let t = targets(&m, &s, 190, &p);
         assert_eq!(t.get(&0), Some(&Side::Long));
@@ -1725,6 +1873,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let mut pf = XsPortfolio::new(100.0);
         for t in 160..=175 {
@@ -1764,6 +1914,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let pf = backtest(&m, &s, 150..199, &p, 100.0);
         assert!(pf.positions.is_empty());
@@ -1822,6 +1974,8 @@ mod tests {
             gross_leverage: 2.0,
             stop_pct: None,
             risk,
+            long_only: false,
+            regime: Regime::Off,
         }
     }
 
@@ -2032,6 +2186,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let bt = backtest(&m, &s, 120..400, &p, 100.0);
         let mut pf = XsPortfolio::new(100.0);
@@ -2074,6 +2230,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let tg = targets(&m, &s, t, &p);
         assert_eq!(tg.get(&1), Some(&Side::Long));
@@ -2106,6 +2264,8 @@ mod tests {
             gross_leverage: 2.0,
             stop_pct: Some(20.0),
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let full = wavy(400);
         let mut altered = full.clone();
@@ -2149,6 +2309,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let mut pf = stepped(&m, &s, 150..180, &p);
         assert!(!pf.positions.is_empty());
@@ -2174,6 +2336,8 @@ mod tests {
             gross_leverage: 1.0,
             stop_pct: None,
             risk: Risk::default(),
+            long_only: false,
+            regime: Regime::Off,
         };
         let pf0 = stepped(&m, &s, 150..199, &p);
         assert_eq!(pf0.positions.len(), 4);

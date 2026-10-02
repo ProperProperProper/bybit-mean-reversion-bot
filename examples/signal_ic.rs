@@ -9,10 +9,11 @@
 //! (lowest values; the flipped direction is the negative of the highest).
 //! A useful entry signal keeps the same sign in every window.
 //!
-//! Usage: `signal_ic [WINDOW_DIR]`. With a directory (window_1.db..window_3.db
-//! holding candles for every perpetual that traded then, e.g. a backup made
-//! before the top-50 refetch), the universe is the top 50 by turnover at each
-//! bar among all of them: no bias towards today's survivors. Holding periods
+//! Usage: `signal_ic [WINDOW_DIR]`. With a directory (window_k.db holding
+//! candles for every eligible token, e.g. `fetch_research_data` HOLDOUT
+//! output), the universe is the top 50 by turnover at each
+//! bar among the stored symbols. Excluding delisted symbols still introduces
+//! survivorship bias. Holding periods
 //! do not overlap (one sample every h bars).
 //!
 //! `WINDOWS=-3,-2,-1,0` picks the windows (default 1,2,3); `SIGNAL=CalmDip`
@@ -55,6 +56,7 @@ struct Stat {
     ic: Vec<f64>,
     low_excess: Vec<f64>,
     high_excess: Vec<f64>,
+    incomplete: usize,
 }
 
 fn mean(v: &[f64]) -> f64 {
@@ -71,25 +73,46 @@ fn tstat(v: &[f64]) -> f64 {
     }
 }
 
-// NOTE(agents): Returns run from the NEXT open (the earliest fill) and are taken relative to the
-//               universe average, so market moves cancel. Samples step by h, so holds never overlap
-//               and t-stats aren't inflated.
+// NOTE(agents): Freeze membership using the decision-time signal BEFORE reading future prices.
+//               Missing endpoints invalidate the whole sample; never replace a missing selected
+//               coin with the next-ranked survivor. Report exclusions: complete-case samples can
+//               still be biased. Non-overlapping holds do not establish statistical independence.
+fn complete_returns(
+    values: &[(usize, f64)],
+    returns: impl Fn(usize) -> Option<f64>,
+) -> Option<Vec<(f64, f64)>> {
+    values
+        .iter()
+        .map(|&(s, v)| {
+            let r = returns(s)?;
+            r.is_finite().then_some((v, r))
+        })
+        .collect()
+}
+
 fn measure(m: &Market, sc: &[Vec<Option<scores::Score>>], p: &xs::XsParams, h: usize) -> Stat {
     let mut st = Stat {
         ic: vec![],
         low_excess: vec![],
         high_excess: vec![],
+        incomplete: 0,
     };
     let mut t = 0;
     while t + h < m.ts.len() {
-        let mut rows: Vec<(f64, f64)> = (0..m.symbols.len())
-            .filter_map(|s| {
-                let v = xs::signal_value(m, sc, s, t, p)?;
-                let r = m.bars[s][t + h]?.close / m.bars[s][t + 1]?.open - 1.0;
-                r.is_finite().then_some((v, r))
-            })
+        let values: Vec<(usize, f64)> = (0..m.symbols.len())
+            .filter_map(|s| xs::signal_value(m, sc, s, t, p).map(|v| (s, v)))
             .collect();
-        if rows.len() >= 2 * PICK {
+        if values.len() >= 2 * PICK {
+            let Some(mut rows) = complete_returns(&values, |s| {
+                let entry = m.bars[s][t + 1]?.open;
+                let exit = m.bars[s][t + h]?.close;
+                (entry.is_finite() && entry > 0.0 && exit.is_finite() && exit > 0.0)
+                    .then_some(exit / entry - 1.0)
+            }) else {
+                st.incomplete += 1;
+                t += h;
+                continue;
+            };
             let avg = rows.iter().map(|x| x.1).sum::<f64>() / rows.len() as f64;
             for x in &mut rows {
                 x.1 -= avg;
@@ -111,6 +134,19 @@ fn measure(m: &Market, sc: &[Vec<Option<scores::Score>>], p: &xs::XsParams, h: u
         t += h;
     }
     st
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn missing_future_price_cannot_replace_a_decision_time_member() {
+        let values: Vec<_> = (0..12).map(|i| (i, i as f64)).collect();
+        assert!(complete_returns(&values, |i| (i != 0).then_some(0.01)).is_none());
+        assert!(complete_returns(&values, |i| (i != 11).then_some(0.01)).is_none());
+        assert_eq!(complete_returns(&values, |_| Some(0.01)).unwrap().len(), 12);
+        assert!(complete_returns(&values, |_| Some(f64::NAN)).is_none());
+    }
 }
 
 // NOTE(agents): This is how entry signals get proven. Workflow: explore on research windows, then
@@ -142,11 +178,12 @@ fn main() -> anyhow::Result<()> {
     println!(
         "universe: {}",
         if historical.is_some() {
-            "top 50 by turnover at each bar among every perpetual that traded then"
+            "top 50 by turnover at each bar among stored symbols (delisted exclusions cause survivorship bias)"
         } else {
             "top 50 among today's tradeable coins (biased towards recent winners)"
         }
     );
+    println!("Incomplete decision-time universes are excluded in full; remaining results are conditional on coverage. t-stat assumes independent samples.");
     println!("IC = mean Spearman(signal, next-open-to-close excess return); t = IC t-stat");
     println!("buy low / buy high = mean excess return (%) of the {PICK} lowest / highest values\n");
     for &signal in walkforward::XS_SIGNALS
@@ -181,20 +218,22 @@ fn main() -> anyhow::Result<()> {
                     ic: stats.iter().flat_map(|x| x.ic.clone()).collect(),
                     low_excess: stats.iter().flat_map(|x| x.low_excess.clone()).collect(),
                     high_excess: stats.iter().flat_map(|x| x.high_excess.clone()).collect(),
+                    incomplete: stats.iter().map(|x| x.incomplete).sum(),
                 };
                 let cells: Vec<String> = stats
                     .iter()
                     .chain(std::iter::once(&pooled))
                     .map(|st| {
                         format!(
-                            "IC {:+.3} t {:+4.1} low {:+5.2}% (t {:+4.1}) high {:+5.2}% (t {:+4.1}) n {}",
+                            "IC {:+.3} t {:+4.1} low {:+5.2}% (t {:+4.1}) high {:+5.2}% (t {:+4.1}) n {} incomplete {}",
                             mean(&st.ic),
                             tstat(&st.ic),
                             mean(&st.low_excess) * 100.0,
                             tstat(&st.low_excess),
                             mean(&st.high_excess) * 100.0,
                             tstat(&st.high_excess),
-                            st.ic.len()
+                            st.ic.len(),
+                            st.incomplete
                         )
                     })
                     .collect();

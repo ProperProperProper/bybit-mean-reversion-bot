@@ -1,8 +1,10 @@
 # Validation — 2 October 2026
 
+All figures below are records of past experiments. The databases they were computed from were deleted in the 2026-10-02 fresh-data reset (user rule: every change restarts the bot on freshly fetched data); rerun the tools to reproduce on new data. The CalmDip holdout is spent and must not be reused for tuning.
+
 ## Long-only strategy (current live)
 
-The user moved the bot to long only and asked for better entry signals. Both sections below use real Bybit data and the observed balance (about 110 USDT). The market-neutral results further down are kept for reference.
+The user moved the bot to long only and asked for better entry signals. Both sections below use real Bybit data and an explicitly supplied observed balance. The market-neutral results further down are kept for reference.
 
 ### Entry evidence on the full historical universe (`signal_ic`)
 
@@ -44,9 +46,9 @@ Data (original run): every USDT perpetual token alive in each window, delisted o
 2. Pooled t ≤ −2 at both: **yes** (−5.3, −5.8).
 3. 24h excess of the 5 bought > 0.2%: **yes** (+0.85%).
 
-**Rerun with delisted tokens hard-excluded (user request, same day).** Delisted tokens were then purged from every database and are never fetched (7–22 per holdout window). The same test on the purged data still passes all three criteria: IC per window at 24h −0.183 / −0.143 / −0.126 / −0.093; pooled t −5.5 (8h) and −6.0 (24h); the 5 bought beat the average coin by +0.89% per 24h (t 2.8). Note that excluding delisted tokens makes this run slightly survivorship-biased; the original run above, with them included, is the unbiased one, and it passed too.
+**Rerun with delisted tokens hard-excluded (user request, same day).** Delisted tokens were then purged from every database and are never fetched (7–22 per holdout window). The same test on the purged data still passes all three criteria: IC per window at 24h −0.183 / −0.143 / −0.126 / −0.093; pooled t −5.5 (8h) and −6.0 (24h); the 5 bought beat the average coin by +0.89% per 24h (t 2.8). Note that excluding delisted tokens makes this run slightly survivorship-biased; the original run included them, but its endpoint filtering also requires review; it should not be described as unbiased.
 
-**What this proves and what it does not.** Out of sample, the coins CalmDip buys beat the **average coin** by about 0.85% per 24h before costs (about 0.65% after an estimated 0.2% round trip). That is a relative edge. A long-only account still carries the whole market's moves, which this test removes; the optional BTC trend filter is the only market-timing element, and it is not covered by this proof. The highest-ranked coins sometimes surge (+8.1% in W−3), so the signal does not support shorting. The sample is 44 non-overlapping days at the 24h hold. A coin delisted during a hold has no closing price and drops out of that sample.
+**What the recorded evidence supports.** Out of sample, the coins CalmDip buys beat the **average coin** by about 0.85% per 24h before costs (about 0.65% after an estimated 0.2% round trip). That is a relative edge. A long-only account still carries the whole market's moves, which this test removes; the optional BTC trend filter is the only market-timing element, and it is not covered by this proof. The highest-ranked coins sometimes surge (+8.1% in W−3), so the signal does not support shorting. The sample is 44 non-overlapping days at the 24h hold. The old evaluator dropped coins with missing future prices before ranking, which could replace decision-time picks. The corrected evaluator excludes the entire sample and reports coverage exclusions.
 
 ### Walk-forward of the live grid (long-only CalmDip, 32 combinations)
 
@@ -66,12 +68,12 @@ Long only is better than the old market-neutral Pulse (no liquidations, shallowe
 
 ## Market-neutral strategy (previous live, for reference)
 
-All numbers come from real Bybit data: closed 15-minute traded and mark-price candles, settled funding, current order books, risk tiers, lot filters and this account's fee rates. They were run on disposable copies of the service's databases, from the account's observed balance (about **110 USDT**).
+All numbers come from real Bybit data: closed 15-minute traded and mark-price candles, settled funding, current order books, risk tiers, lot filters and this account's fee rates. They were run on disposable copies of the service's databases, from the account's observed balance (recorded explicitly).
 
 ## Tests
 
 ```sh
-cargo test --release --all-targets   # 64 tests, all pass
+cargo test --release --all-targets   # 67 tests, all pass (2026-10-02)
 cargo clippy --all-targets -- -D warnings   # clean
 ```
 
@@ -112,18 +114,24 @@ No family passes the walk-forward in more than one of three windows, and none ha
 | PriceAction | 0 / 3 | −17.2% | +18.5% |
 | Volatility | 1 / 3 | −9.1% | +7.8% |
 | Rsi | 1 / 3 | +0.2% | −7.1% |
-| Pulse (live) | 0 / 3 | −20.7% | +5.1% |
+| Pulse (then live) | 0 / 3 | −20.7% | +5.1% |
 | Funding | 0 / 3 | −4.2% | −2.5% |
 | All together | 0 / 3 | −9.1% | +5.1% |
 
-Switching to the best-looking family on these same windows would be curve-fitting, so the live family is unchanged. The gate keeps paper flat while it fails.
+Switching to the best-looking family on these same windows would have been curve-fitting; the strategy later moved to long-only CalmDip on the strength of the broad-universe signal study and its pre-registered holdout (top of this page), not this table.
 
 ## Live service
 
-Deployed 2026-10-01 14:40 UTC from this tree. The first bars under the new code processed all 50 symbols; the walk-forward reports `FAILED`, so the paper account takes no new positions.
+Long-only CalmDip paper bot, restarted with a fresh-data reset on 2026-10-02: new paper account, all market data, rules and research windows fetched again from Bybit. The dashboard (http://127.0.0.1:8787) shows the current verdict, positions and P&L; this document records no live performance yet.
 
 ## Reproduce
 
 1. Copy `data.db` and `window_1.db` to `window_3.db` from `~/Library/Application Support/BybitMeanReversionBot` with `sqlite3 SRC ".backup DEST"` (never run tools against the live files).
 2. Run `validate_cached` on the copy with the observed balance.
 3. Run `EQ=<balance> cargo run --release --example research` for the family table.
+
+## Follow-up verification — 2 October 2026
+
+The corrected `signal_ic` was rerun on disposable backups of the four purged holdout databases, with the signal and horizons unchanged. Missing future endpoints now exclude the entire decision-time universe rather than change its membership. No eligible samples were excluded: 148 complete 8h samples and 44 complete 24h samples. Pooled 8h IC is −0.079 (t −5.5), relative excess +0.31%; pooled 24h IC is −0.136 (t −6.0), relative excess +0.89% (t +2.8). Every window's IC remains negative at both horizons.
+
+The registered thresholds still pass on these stored symbols. Excluding delisted tokens leaves survivorship bias, and the reported t-statistics assume independent observations; non-overlapping holds alone do not justify that assumption. These returns omit actual strategy execution and are not account-profit forecasts. The original unpurged databases were not available for this rerun.

@@ -172,9 +172,6 @@ pub enum NextAction {
     TakeProfit,
     Add,
     Rebalance,
-    /// The token is no longer trading normally (delisted or delisting
-    /// scheduled): close at the next open, never overridden.
-    Delisting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,23 +591,6 @@ impl XsPortfolio {
         }
     }
 
-    // NOTE(agents): User requirement: delisted/delisting tokens are hard-excluded. The service
-    //               calls this AFTER replaying missed bars so the exit fills at the next open,
-    //               never at a replayed (historical) bar.
-    /// Queue an exit at the next open for every held token not in `trading`
-    /// (Bybit's tokens that trade with no delisting scheduled). Returns them.
-    pub fn exit_delisting(&mut self, trading: &std::collections::HashSet<String>) -> Vec<String> {
-        let mut out = Vec::new();
-        for pos in &mut self.positions {
-            if !trading.contains(&pos.symbol) && pos.next_action != Some(NextAction::Delisting) {
-                pos.next_action = Some(NextAction::Delisting);
-                pos.action_not_before = 0;
-                out.push(pos.symbol.clone());
-            }
-        }
-        out
-    }
-
     /// Cancel queued entries when the report changes; retain risk exits.
     pub fn install_entry_gate(&mut self, allowed: bool) {
         self.entries_allowed = allowed;
@@ -840,12 +820,6 @@ impl XsPortfolio {
                     }
                     continue;
                 }
-                (Some(NextAction::Delisting), Some(b)) => {
-                    if !self.close_market(m, i, ts, b.open, "Delisting") {
-                        return;
-                    }
-                    continue;
-                }
                 (Some(action), None) => self.positions[i].next_action = Some(action),
                 (Some(NextAction::Add), Some(_)) if !rebalancing && self.entries_allowed => {
                     self.add(m, t, i, p)
@@ -1010,12 +984,7 @@ impl XsPortfolio {
             let against = -s * (b.close - pos.entry) / pos.entry * 100.0;
             let pending_exit = matches!(
                 pos.next_action,
-                Some(
-                    NextAction::Stop
-                        | NextAction::TakeProfit
-                        | NextAction::Rebalance
-                        | NextAction::Delisting
-                )
+                Some(NextAction::Stop | NextAction::TakeProfit | NextAction::Rebalance)
             );
             if pending_exit {
                 i += 1;
@@ -1185,10 +1154,12 @@ impl XsPortfolio {
                 self.start_equity,
                 self.peak,
                 self.max_dd,
-                self.cost_mult
+                self.cost_mult,
+                self.reserved
             ]
             .iter()
             .all(|v| v.is_finite())
+                && self.reserved >= 0.0
                 && self.start_equity > 0.0
                 && self.cost_mult > 0.0,
             "invalid persisted account values"
@@ -1237,6 +1208,19 @@ impl XsPortfolio {
     /// order-book cost and fee.
     pub fn close_all(&mut self, m: &Market, ts: i64, reason: &str) {
         if self.execution_error.is_some() {
+            return;
+        }
+        // NOTE(agents): Paper may defer newest-boundary funding until its real mark arrives.
+        // A terminal backtest cannot finish with that liability silently omitted.
+        if let Some(pos) = self.positions.iter().find(|pos| {
+            m.funding[pos.sym].iter().any(|&(settled, _)| {
+                settled == ts && pos.entry_ts < settled && pos.last_funding_ts != Some(settled)
+            })
+        }) {
+            self.execution_error = Some(format!(
+                "{}: final settlement at {ts} is unpaid; load its real boundary mark before closing",
+                pos.symbol
+            ));
             return;
         }
         while !self.positions.is_empty() {
@@ -1392,6 +1376,17 @@ mod tests {
 
     fn sc(m: &Market) -> Vec<Vec<Option<Score>>> {
         crate::engine::scores::compute(m, 100)
+    }
+
+    #[test]
+    fn persisted_reserved_margin_must_be_finite_and_nonnegative() {
+        let mut pf = XsPortfolio::new(100.0);
+        for reserved in [f64::NAN, f64::INFINITY, -1.0] {
+            pf.reserved = reserved;
+            assert!(pf.validate_state().is_err());
+        }
+        pf.reserved = 150.0; // Commitments can exceed equity; this blocks entries.
+        assert!(pf.validate_state().is_ok());
     }
 
     #[test]
@@ -1798,22 +1793,21 @@ mod tests {
     }
 
     #[test]
-    fn delisting_tokens_exit_at_the_next_open() {
-        let m = market(&[vec![100.0; 200], vec![100.0; 200]]);
-        let p = risk_params(Risk {
-            add_pct: Some(1.0),
-            ..Default::default()
-        });
+    fn terminal_close_cannot_omit_deferred_funding() {
+        let mut m = flat_with(&[]);
+        let p = risk_params(Risk::default());
         let mut pf = XsPortfolio::new(1000.0);
         pf.open(&m, 100, 0, Side::Long, 200.0, &p);
-        pf.open(&m, 100, 1, Side::Long, 200.0, &p);
-        let trading: std::collections::HashSet<String> = ["S1USDT".to_string()].into();
-        assert_eq!(pf.exit_delisting(&trading), vec!["S0USDT".to_string()]);
-        assert!(pf.exit_delisting(&trading).is_empty(), "queued once");
-        pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
+        let end = m.ts.last().unwrap() + BAR_MS;
+        m.funding[0] = vec![(end, 0.01)];
+        pf.close_all(&m, end, "End of test");
+        assert!(pf
+            .execution_error
+            .as_ref()
+            .unwrap()
+            .contains("final settlement"));
         assert_eq!(pf.positions.len(), 1);
-        assert_eq!(pf.positions[0].symbol, "S1USDT");
-        assert_eq!(pf.trades[0].reason, "Delisting");
+        assert!(pf.trades.is_empty());
     }
 
     #[test]

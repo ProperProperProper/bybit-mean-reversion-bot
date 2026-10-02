@@ -27,8 +27,7 @@ Paper trading and signals only. It never places orders.
 - **`advance_paper(ps, market, scores, next, allowed, ready_ts, observed)`:**
   1. Replays every bar after the checkpoint with the **previous** settings. Replay must continue exactly from the checkpoint, and a settlement that turns up late for an already processed bar is an error.
   2. Then applies the observed account: a wallet change is mirrored as a deposit or withdrawal (`cash_flow`, never profit), and the account's committed margin becomes `reserved`.
-  3. Queues a `Delisting` exit for any held token Bybit no longer lists as trading normally (after replay, so it fills at the next open, never at a replayed bar).
-  4. Installs the newest settings and entry eligibility (cancelling stale queued entries), decides at the latest close, and defers any fill to the first open after `ready_ts`.
+  3. Installs the newest settings and entry eligibility (cancelling stale queued entries), decides at the latest close, and defers any fill to the first open after `ready_ts`.
 
 ### `serve(dir)`
 
@@ -41,8 +40,8 @@ The console chart: settings chosen by the live walk-forward on research window 2
 ### `bar_task`: once per closed 15-minute bar
 
 1. Lists the top 75 token USDT perpetuals by 24h turnover and stores their launch times; hourly, re-measures their rules. The universe is the top 50 of them with complete rules (a warning is logged if fewer qualify).
-2. Reads the real account: wallet and committed margin. Purges every stored row of tokens that are neither trading (no delisting scheduled) nor held.
-3. Syncs traded and mark candles and funding for the universe plus any held symbol.
+2. Reads the real account: wallet and committed margin. Purges every stored row of ineligible symbols (delisted, delisting, missing/invalid leverage, 1×-only). A held ineligible symbol fails the bar for explicit recovery: it is never fetched and never given an invented exit.
+3. Syncs traded and mark candles and funding for the universe plus any held (eligible) symbol.
 4. Builds the 14-day market. **A symbol with incomplete real data sits out this bar** (logged); a held symbol must be complete or the bar fails.
 5. Runs the live walk-forward from the free balance: paper equity (or the wallet) minus committed margin.
 6. Advances the paper account (above) with entries allowed only when the report `PASSED` or is `FORWARD TEST`, saves it, and logs each account change, open, add and close.

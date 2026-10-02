@@ -72,8 +72,11 @@ impl Client {
                     let body = resp.text().await.unwrap_or_default();
                     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let code = v["retCode"].as_i64().unwrap_or(-1);
-                    if status.as_u16() == 429 || code == 10006 || code == 10018 {
-                        err = anyhow!("{path}: rate limited");
+                    // NOTE(agents): 10016 is Bybit's transient "svc error"; it failed whole
+                    //               bars and research fetches on 2026-10-02. Retry it like a rate
+                    //               limit; any other non-zero retCode still fails at once.
+                    if status.as_u16() == 429 || matches!(code, 10006 | 10016 | 10018) {
+                        err = anyhow!("{path}: rate limited or transient Bybit error {code}");
                         tokio::time::sleep(Duration::from_secs(2u64 << attempt)).await;
                         continue;
                     }
@@ -106,10 +109,7 @@ impl Client {
             }
             let r = self.get("/v5/market/instruments-info", &q).await?;
             for i in r["list"].as_array().cloned().unwrap_or_default() {
-                if is_token_perpetual(&i)
-                    && i["status"] == "Trading"
-                    && strict(&i["deliveryTime"]) == Some(0.0)
-                {
+                if is_eligible_instrument(&i) {
                     let l = &i["lotSizeFilter"];
                     let lot = (|| {
                         Some(LotFilter {
@@ -316,8 +316,8 @@ impl Client {
             let v: Value = serde_json::from_str(&body)?;
             match v["retCode"].as_i64() {
                 Some(0) => return Ok(v["result"].clone()),
-                Some(10006 | 10018) => {
-                    err = anyhow!("{path}: rate limited");
+                Some(10006 | 10016 | 10018) => {
+                    err = anyhow!("{path}: rate limited or transient Bybit error");
                     tokio::time::sleep(Duration::from_secs(2u64 << attempt)).await;
                 }
                 _ => bail!(
@@ -593,6 +593,45 @@ fn is_token_perpetual(i: &Value) -> bool {
         && i["isPreListing"] == false
         && i["underlyingTicker"].as_str() == Some("")
         && matches!(i["symbolType"].as_str(), Some("" | "innovation"))
+}
+
+// NOTE(agents): Reject before turnover ranking, rules requests or candle fetching.
+// Missing/invalid leverage is ineligible; 1x-only contracts cannot use leverage.
+fn is_eligible_instrument(i: &Value) -> bool {
+    is_token_perpetual(i)
+        && i["status"] == "Trading"
+        && strict(&i["deliveryTime"]) == Some(0.0)
+        && strict(&i["leverageFilter"]["maxLeverage"]).is_some_and(|max| max > 1.0)
+}
+
+#[cfg(test)]
+mod eligibility_tests {
+    use super::*;
+    #[test]
+    fn excludes_delisted_and_unleveraged_before_fetching() {
+        let eligible = serde_json::json!({
+            "quoteCoin":"USDT", "contractType":"LinearPerpetual", "isPreListing":false,
+            "underlyingTicker":"", "symbolType":"", "status":"Trading", "deliveryTime":"0",
+            "leverageFilter":{"maxLeverage":"2"}
+        });
+        assert!(is_eligible_instrument(&eligible));
+        for status in ["Closed", "Settling", "Delivering", "PreLaunch"] {
+            let mut i = eligible.clone();
+            i["status"] = status.into();
+            assert!(!is_eligible_instrument(&i));
+        }
+        for max in ["", "0", "1", "NaN", "Infinity", "invalid"] {
+            let mut i = eligible.clone();
+            i["leverageFilter"]["maxLeverage"] = max.into();
+            assert!(!is_eligible_instrument(&i));
+        }
+        let mut i = eligible.clone();
+        i["leverageFilter"] = serde_json::Value::Null;
+        assert!(!is_eligible_instrument(&i));
+        let mut i = eligible;
+        i["deliveryTime"] = "1790844328000".into();
+        assert!(!is_eligible_instrument(&i));
+    }
 }
 
 /// The first `n` of `candidates` (ranked by turnover) that have complete Bybit

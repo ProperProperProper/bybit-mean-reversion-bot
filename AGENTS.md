@@ -1,6 +1,23 @@
 # Notes for agents (Codex, Claude) working on this repo
 
-Last updated 2026-10-02 by Claude Code. Read this before changing anything.
+Last updated 2026-10-02 by Codex and Claude Code. Read this before changing anything.
+
+## Mandatory fresh-data rule — user instruction, 2 October 2026
+
+**This applies to both Codex and Claude. After EVERY change to this repository, including code, configuration, strategy parameters and documentation, delete the old bot data and start the current bot fresh. Do not reuse stale data or paper state across changes.** Batch edits belonging to one change, then perform this reset before declaring the change complete.
+
+Required sequence:
+
+1. Build and run the appropriate tests on the final current tree.
+2. Stop the running service and verify it has stopped. If service control is denied or stopping cannot be verified, do not delete an active SQLite database. Report the reset/restart as blocked and the change as operationally incomplete.
+3. Delete the old runtime market cache and its SQLite WAL/SHM files, paper-account state and trade history, research/holdout databases, old data backups, stale logs and disposable working database copies. **Do not archive or retain old data as a substitute for deletion.** Remove derived cached results that would otherwise be reused by the bot.
+4. Preserve source code, agent instructions, credentials/Keychain entries, secrets, installed binaries and launch configuration. This rule never authorizes deleting credentials or unrelated files.
+5. Install the current tested bot, keeping the stable signing identifier described below, and restart it in its existing paper mode. Fetch market data and rules again from Bybit; listing history and leverage eligibility must also be obtained afresh. Never seed the new run from old snapshots or invent missing data.
+6. Verify the new process and newly created data. State what was deleted and whether the fresh start succeeded. Never claim a fresh start when old data remains or the process has not restarted.
+
+The user has explicitly authorized this reset after every change; do not ask again for discretionary confirmation. Request only permissions actually required by the environment. A denied permission or service-control operation is a blocker, not permission to bypass the restriction. This instruction overrides earlier advice to retain old runtime backups or paper state across deployments. Historical figures in documentation are records of past experiments, not inputs to reuse in a new run.
+
+Current reset status: the latest committed tree was reset and restarted fresh on 2026-10-02 by Claude Code (service stopped and verified, all runtime/research/holdout/backup data and disposable copies deleted, research windows and live data refetched from Bybit). A prepared stop/reset/deploy script is at `/Users/local.local/Documents/Codex/2026-10-01/l/outputs/fresh-start-bot.sh`; it checks the launchd job but not the process, so also verify with `pgrep -f 'BybitMeanReversionBot/bin/bot'` before deleting.
 
 ## Notes in the code
 
@@ -18,7 +35,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - **Improve entry signals**, judged on real data and on data the signal never saw.
 - **Real data and real code paths only.** Never fill a missing candle, fee, tier or balance with an invented or default value. A missing input means "don't trade" or an explicit error.
 - **Top 50 Bybit token USDT perpetuals by 24h turnover that have complete Bybit rules** (margin tiers, account fee, lot filter, measured book). The top 75 are measured; coins without data are dropped.
-- **Delisted tokens are hard-excluded** (user request): never fetched or entered, held ones exit at the next open (`NextAction::Delisting`), and `Cache::retain_symbols` deletes their stored rows every bar and in every research/holdout DB. Do not reintroduce delisted symbols anywhere, research included.
+- **Delisted tokens are hard-excluded** (user request): never fetched or entered, excluded held symbols stop paper with an explicit recovery error rather than fetch excluded contracts or fabricate exits, and `Cache::retain_symbols` deletes their stored rows every bar and in every research/holdout DB. Do not reintroduce delisted symbols anywhere, research included.
 - **5 USDT floor:** no entries or adds while the free balance (wallet minus margin committed anywhere on the account) is below 5 USDT.
 - No dead code. Strict clippy clean. The user works unattended: don't stop to ask, redeploy when needed, commit and push when done.
 - Report results honestly, including losses. Don't tune on the test windows until a number looks good.
@@ -35,20 +52,32 @@ Keep them current: if you change the behaviour a note describes, update or remov
 
 - All findings in `docs/audit.md` are fixed with regression tests (mark-price funding/liquidation, isolated margin, neutral fills, lot rounding, risk-tier deductions, new listings, balance floor, and more).
 - Live grid: `walkforward::live_grid()` = long-only `Signal::CalmDip` (unflipped), hold 8h or 24h, 3 or 5 coins, 1× or 2×, stop none or 10%, BTC trend filter off or on (32 combos).
-- The walk-forward of the full strategy (relative edge + market exposure + costs) passes in 1 of 4 data sets; forward tests −9.8% and +21.9%. The signal's relative edge is proven out of sample (above); whether the long-only *account* makes money also depends on the market. See `docs/validation.md`.
+- The walk-forward of the full strategy (relative edge + market exposure + costs) passes in 1 of 4 data sets; forward tests −9.8% and +21.9%. The signal has positive relative evidence on the tested sample; whether the long-only *account* makes money also depends on the market. See `docs/validation.md`.
 
 ## Evidence and traps
 
 - **Survivorship / look-ahead bias:** the research windows (`window_k.db`) contain only *today's* top-50 coins. Coins are often top-turnover now *because* they just rallied, so long-only backtests on those windows look much better than reality (window 3: equal-weight +47%). Momentum-style long signals look good there and fail on the full historical universe.
-- **The broad-universe test:** `cargo run --release --example signal_ic -- <dir>`, where `<dir>` holds windows with candles for every trading token (`holdout/` for Jun 25 → Aug 20; `backup-20261002-0029/` for windows 1–3, purged of delisted tokens). It ranks the top 50 by turnover at each bar, not today's top 50, and measures each signal's rank correlation with next-open-to-close returns relative to the average coin, over non-overlapping holds.
+- **The broad-universe test:** `cargo run --release --example signal_ic -- <dir>`, where `<dir>` holds windows with candles for every eligible token (create them with `HOLDOUT=k,... fetch_research_data`; the holdout and backup databases used on 2026-10-02 were deleted in the fresh-data reset). It ranks the top 50 by turnover at each bar, not today's top 50, and measures each signal's rank correlation with next-open-to-close returns relative to the average coin, over non-overlapping holds.
 - On that full universe, two effects held in all 3 windows at every holding period: **higher volatility → lower relative return**, and **24h losers beat 24h winners**. `CalmDip` = mean of the volatility and 24h-return percentiles combines them.
-- **CalmDip passed a pre-registered holdout test** (first run included delisted tokens; rerun after the hard exclusion also passes: pooled t −5.5 / −6.0, +0.89% per 24h) (commits 5329e48 and 6988079 fixed the criteria and the definition before the data was fetched): four never-seen windows, 2026-06-25 → 08-20, full universe including delisted coins (`runtime/holdout/window_-3..0.db`). IC negative in every window; pooled t −5.3 (8h) and −5.8 (24h); the 5 coins bought beat the average coin by +0.85% per 24h (t 2.7). This is a proven **relative** edge, not market timing: long-only P&L still follows the market. Don't re-tune CalmDip on the holdout; it is spent as a test now. New ideas need their own fresh holdout (e.g. windows before 2026-06-25).
+- **CalmDip passed a pre-registered holdout test** (first run included delisted tokens; rerun after the hard exclusion also passes: pooled t −5.5 / −6.0, +0.89% per 24h) (commits 5329e48 and 6988079 fixed the criteria and the definition before the data was fetched): four never-seen windows, 2026-06-25 → 08-20, full universe including delisted coins (those databases have since been deleted; the results are recorded in docs/validation.md). IC negative in every window; pooled t −5.3 (8h) and −5.8 (24h); the 5 coins bought beat the average coin by +0.85% per 24h (t 2.7). This is positive **relative** evidence, not market timing: long-only P&L still follows the market. Don't re-tune CalmDip on the holdout; it is spent as a test now. New ideas need their own fresh holdout (e.g. windows before 2026-06-25).
 - Pulse momentum (buying the strongest Pulse) *lost* to the average coin in all 3 windows on the full universe, even though it looks good on today's top 50.
-- At ~110 USDT, slots are 11–40 USDT, so lot rounding and minimum orders matter. Results are noisy, and single-coin moves dominate.
+- At small balances, lot rounding and minimum orders matter. Results are noisy, and single-coin moves dominate.
 
 ## Good next steps
 
 1. Let the paper account run on new data; compare it with equal-weight buy-and-hold of the same universe over the same days (the edge is relative to that).
-2. Build an unbiased backtest: fetch mark candles, listing times (instruments-info with `status` filters for delisted coins) and funding for the full historical universe, so the walk-forward itself runs without survivorship bias.
+2. Make the walk-forward itself run on the broad universe (every eligible token ranked by turnover at the time, not today's top 50), with mark candles, listing times and funding. Delisted tokens stay excluded (user rule), so some survivorship bias remains; state it with any result.
 3. Test further entry ideas with `signal_ic` on the full universe *before* adding them to a grid. Only add signals whose sign holds in every window.
 4. Exits: a 24h hold is a blunt exit. Test take-profit / time-stop variants with `examples/risk_variants.rs` once the entry is settled.
+
+## Follow-up code review (2026-10-02, Codex)
+
+- `signal_ic` now freezes decision-time membership before reading future prices. A missing endpoint excludes the whole sample and increments `incomplete`; it never replaces a missing coin with a survivor. This is still conditional-on-coverage analysis, not an unbiased missing-outcome estimator.
+- A rerun on backups of the purged holdout found zero incomplete samples; 24h relative excess remains +0.89%, pooled IC t −6.0 (8h −5.5). Delisted exclusion retains survivorship bias. Non-overlap does not imply independent samples; reported t-statistics assume independence.
+- `validate_state` rejects nonfinite or negative reserved margin. Commitments above equity remain valid and block entries.
+- Terminal closing rejects an unpaid funding settlement at the closing timestamp. Paper still defers newest-boundary funding until its real mark open arrives.
+- Settlement revision detection does not establish detection of repaired historical candles or removed funding rows. Do not describe those as fully reconciled.
+- Volatility-scaled orders delayed by missing candles recompute weights at execution; the live grid leaves volatility scaling disabled. Do not enable it before storing decision-time weights.
+
+- Strict instrument eligibility also requires a finite Bybit `leverageFilter.maxLeverage > 1`. Missing, malformed and 1x-only contracts are rejected before ranking, rule requests, scoring or fetching candles, in live and research discovery.
+- Held symbols outside the top 50 remain managed only while still instrument-eligible. Excluded held symbols are purged and require explicit recovery; no excluded-symbol candle requests are made.

@@ -149,7 +149,7 @@ fn persist_paper(path: &Path, state: &PaperState) -> Result<()> {
 }
 
 // NOTE(agents): Causality order: (1) replay missed bars with the PREVIOUS settings, (2) apply what
-//               was observed now (wallet change, committed margin, delisting exits), (3) install
+//               was observed now (wallet change, committed margin), (3) install
 //               new settings and decide at the latest close. Anything learned now must never change
 //               a replayed bar.
 /// Replay only contiguous unseen bars with the previously known settings.
@@ -161,9 +161,8 @@ fn advance_paper(
     next: &XsParams,
     allowed: bool,
     ready_ts: i64,
-    // The real account and the tokens trading normally, observed this bar.
-    observed: Option<(data::AccountBalance, &std::collections::HashSet<String>)>,
-) -> Result<Vec<String>> {
+    observed: Option<data::AccountBalance>,
+) -> Result<()> {
     anyhow::ensure!(!market.ts.is_empty(), "empty paper market");
     anyhow::ensure!(
         market.ts.windows(2).all(|w| w[1] - w[0] == BAR_MS),
@@ -229,7 +228,7 @@ fn advance_paper(
             }
         }
     }
-    if let Some((account, _)) = observed {
+    if let Some(account) = observed {
         let balance = account.wallet;
         anyhow::ensure!(
             balance.is_finite() && balance >= 0.0,
@@ -251,13 +250,10 @@ fn advance_paper(
         candidate.portfolio.install_entry_gate(allowed);
     }
     candidate.params = Some(next.clone());
-    // Delisting is known from now on: held tokens Bybit no longer lists as
-    // trading normally exit at the next open (never at a replayed bar).
-    let delisting = observed.map_or_else(Vec::new, |(_, t)| candidate.portfolio.exit_delisting(t));
     candidate.portfolio.decide_close(market, sc, t, next);
     candidate.portfolio.defer_new_decisions(ready_ts);
     *ps = candidate;
-    Ok(delisting)
+    Ok(())
 }
 
 struct App {
@@ -444,10 +440,10 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // their full Bybit rules: order rules, the account's fees, margin tiers,
         // measured books. The universe is the top 50 with complete rules.
         let lots = app.client.usdt_perpetual_lots().await?;
-        // NOTE(agents): The only list of tradeable tokens. Held tokens missing from it get a
-        //               Delisting exit, and their data is purged once they are no longer held.
-        // Tokens trading with no delisting scheduled: everything else is
-        // hard-excluded (never entered, held ones exit, stored rows deleted).
+        // NOTE(agents): The only list of tradeable tokens: trading, no delisting scheduled, maximum
+        //               leverage above 1x. Everything else is hard-excluded before ranking,
+        //               fetching or scoring; its stored rows are deleted, and a held one stops the
+        //               bar for explicit recovery (see below).
         let trading: std::collections::HashSet<String> =
             lots.iter().map(|(s, _, _)| s.clone()).collect();
         let candidates = app
@@ -493,27 +489,26 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         }
         let mut symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
         app.cache.put_universe(&symbols)?;
-        // Keep managing previously held symbols even if turnover leaves the top 50.
+        // NOTE(agents): Strict exclusion includes stale held symbols. Purge their cached data
+        // before any fetch; an excluded holding requires explicit recovery, never a fabricated exit.
+        let purged = app.cache.retain_symbols(&trading)?;
+        if purged > 0 {
+            app.event(
+                "INFO",
+                format!("purged stored data of {purged} ineligible symbol(s)"),
+            );
+        }
+        // Keep managing eligible held symbols even if turnover leaves the top 50.
         if let Some(ps) = app.paper.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             for pos in &ps.portfolio.positions {
+                anyhow::ensure!(trading.contains(&pos.symbol),
+                    "held symbol {} is delisted or lacks eligible leverage; excluded from fetching, recovery required", pos.symbol);
                 if !symbols.contains(&pos.symbol) {
                     symbols.push(pos.symbol.clone());
                 }
             }
         }
         symbols.sort();
-        // NOTE(agents): Keep held symbols until they are closed, so the exit has real prices;
-        //               everything else not trading is deleted.
-        // Purge every stored row of tokens that are neither trading nor held.
-        let keep: std::collections::HashSet<String> =
-            trading.iter().chain(&symbols).cloned().collect();
-        let purged = app.cache.retain_symbols(&keep)?;
-        if purged > 0 {
-            app.event(
-                "INFO",
-                format!("purged stored data of {purged} delisted or non-token symbol(s)"),
-            );
-        }
         let hb2 = hb.clone();
         let last = data::sync(&app.client, &app.cache, &symbols, move |_, _| hb2.beat()).await?;
         if last < closed {
@@ -634,7 +629,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                 );
                 // The symbol list is re-fetched every bar: re-point positions by name.
                 ps.portfolio.reindex(&market.symbols);
-                let delisting = advance_paper(
+                advance_paper(
                     ps,
                     &market,
                     &sc,
@@ -644,16 +639,13 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                     //               managed when it is closed.
                     report.passed || report.forward_ok(),
                     chrono::Utc::now().timestamp_millis(),
-                    Some((account, &trading)),
+                    Some(account),
                 )?;
                 persist_paper(&app.dir.join(PAPER_FILE), ps)?;
                 let mut lines: Vec<String> = flow
                     .map(|d| format!("ACCOUNT observed external wallet change {d:+.8} USDT (now {balance:.8}): paper capital adjusted after replay; source unclassified"))
                     .into_iter()
                     .collect();
-                lines.extend(delisting.iter().map(|s| {
-                    format!("PAPER {s} is delisted or delisting: exit queued for the next open")
-                }));
                 lines.extend(ps.portfolio.trades[before_trades..].iter().map(|t| {
                     format!(
                         "PAPER close {:?} {} ({}) pnl {:+.2} USDT, held {}m",

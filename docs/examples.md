@@ -31,7 +31,7 @@ Long-only families by default (`NEUTRAL=1` for the market-neutral ones), plus bu
 
 ## `signal_ic.rs`: entry-signal study
 
-`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory of windows holding candles for every trading token (e.g. `holdout/`, or the purged backup windows); the universe is then the top 50 by turnover at each bar rather than today's top 50. `WINDOWS=` picks windows, `SIGNAL=` one signal. No network.
+`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory of windows holding candles for every trading token (e.g. `holdout/` created by `HOLDOUT=` mode); the universe is then the top 50 by turnover at each bar rather than today's top 50. `WINDOWS=` picks windows, `SIGNAL=` one signal. Missing future endpoints exclude an entire frozen decision-time sample, and the output reports the exclusion count. Results remain conditional on coverage and stored-symbol selection. The t-statistic assumes independent observations. No network.
 
 ## `risk_variants.rs`: `main()`
 

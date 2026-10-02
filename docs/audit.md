@@ -1,8 +1,8 @@
 # Audit status — 2 October 2026
 
-This page tracks every finding from the 1 October audit and the follow-up audit of 2 October, with its current state in the code. "Fixed" means the code changed and a regression test covers it; the test is named. Everything was verified on the working tree in this repository, and the deployed service was rebuilt from it.
+This page tracks every finding from the 1 October audit and the follow-up audit of 2 October, with its current state in the code. "Fixed" means the code changed and a regression test covers it; the test is named. Everything listed is in the committed tree, which was deployed with a fresh-data reset on 2026-10-02.
 
-**Bottom line:** the accounting, data and recovery defects found so far are fixed. With them fixed, the strategy does **not** pass its own validation on real data (see [validation.md](validation.md)). The bot therefore stays flat in paper. No strategy family tested so far shows a robust out-of-sample edge.
+The earlier findings have fixes, with the additional qualifications below. With them fixed, the old market-neutral Pulse strategy failed its validation on real data. The live strategy is now long-only CalmDip, whose entry signal met pre-registered out-of-sample thresholds as a **relative** edge; the full strategy passes its walk-forward on 1 of 4 data sets ([validation.md](validation.md)). Paper trades only while the walk-forward gate allows.
 
 ## Findings from the 1 October audit
 
@@ -10,7 +10,7 @@ This page tracks every finding from the 1 October audit and the follow-up audit 
 |---|---|---|---|
 | 1 | Queued exits bypassed liquidation at a gap open | Fixed: carried positions are checked for mark-price liquidation at the open before any queued stop, take-profit, rebalance or add | `xs::step`; `mark_gap_liquidates_before_queued_stop` |
 | 2 | Funding did not reduce depleted isolated margin | Fixed: funding takes free cash first, then the position's margin, and the liquidation price is recomputed | `charge_funding`; `funding_uses_mark_and_debits_isolated_margin` |
-| 3 | Late funding / repaired candles did not reconcile paper | Fixed as "fail visibly": paper records every settlement it applied; a settlement that appears later for a bar already processed stops the paper account with an explicit recovery error rather than silently diverging | `service::advance_paper` |
+| 3 | Late funding did not reconcile paper | Fixed as "fail visibly": paper records every settlement it applied; a settlement that appears later for a bar already processed stops the paper account with an explicit recovery error rather than silently diverging | `service::advance_paper` |
 | 4 | A failed report could execute targets queued by an old schedule | Fixed: a settings or eligibility change cancels queued entries; entries check eligibility at execution | `install_entry_gate`; `disabled_gate_and_report_delay_prevent_stale_entries` |
 | 5 | Newly observed cash flow changed historical replay | Fixed: missed bars replay first; the balance change applies at the observation boundary | `advance_paper` |
 | 6 | Paper replay silently skipped history outside the loaded window | Fixed: replay must continue exactly from the checkpoint or it errors | `advance_paper` |
@@ -66,10 +66,21 @@ Tests: `no_entries_or_adds_below_the_free_balance_floor`, `account_balance_reser
 
 **N. Deployment and the LuLu firewall.** The linker signs each build ad hoc with an identifier that embeds a build hash. The LuLu allow rule for the installed bot matches path **and** signing identifier, so every redeploy would wait on a firewall prompt. `deploy.sh` now re-signs the installed binary with the identifier the existing rule expects.
 
-## Known limitations (not defects)
+## Remaining limitations and review findings
 
-- **Survivorship bias in the research windows.** `window_k.db` holds today's top-50 coins only, which favours coins that recently rallied. Long-only backtests on those windows are inflated; entry evidence comes from `signal_ic` on the full historical universe (backup windows with every perpetual that traded then).
+- **Survivorship bias in the research windows.** `window_k.db` holds today's top-50 coins only, which favours coins that recently rallied. Long-only backtests on those windows are inflated; entry evidence comes from `signal_ic` on broad-universe windows (every eligible token ranked by turnover at the time).
 - **No independent holdout.** The research windows were also used to choose the strategy family. Only data that arrives after a frozen procedure is an untouched test.
 - **Historical execution uses today's measurements.** Order books, fees and risk tiers are current measurements applied to past bars; Bybit publishes no historical books.
 - **Results are noise-sensitive at this balance.** With 11–22 USDT slots, small sizing differences change which coins pass the lot checks; doubling costs can change the selected coins and with them the result. Single-coin moves (squeezes of +50% to +100%) dominate the outcomes.
 - **Late settlements stop paper rather than reconcile it.** If Bybit publishes a settlement after its bar was processed, the paper account stops with an explicit error; there is no automatic replay from an earlier checkpoint.
+
+## Follow-up review — Codex, 2 October
+
+- Fixed future-endpoint filtering in `signal_ic`; membership is frozen before future prices are read. Missing prices exclude the whole sample, with an explicit count. Regression: `missing_future_price_cannot_replace_a_decision_time_member`. The purged holdout rerun has zero excluded samples and unchanged 24h results; survivorship bias remains.
+- Fixed persisted reserved-margin validation. Regression: `persisted_reserved_margin_must_be_finite_and_nonnegative`.
+- Fixed silent omission of deferred terminal funding: a final close now fails explicitly if a closing-boundary settlement remains unpaid. It requires the real boundary mark, rather than estimating one. Regression: `terminal_close_cannot_omit_deferred_funding`.
+- Historical candle repairs and removed funding rows are not detected by the current settlement ledger. The earlier broad recovery claim was too strong. Automatic reconciliation remains unimplemented.
+- The strategy's relative evidence is conditional on stored-symbol coverage. Non-overlapping returns can still be dependent; the current t-statistic does not correct for that.
+- Delayed volatility-scaled rebalances compute weights from the execution bar's preceding candle rather than storing decision-time weights. The current live grid disables this option; its delayed-execution semantics still need correction before enabling it.
+- Removed the `Delisting` exit path: after the strict eligibility change, a held ineligible symbol stops the bar for explicit recovery before replay, so `exit_delisting` could no longer run (dead code).
+- Bybit's transient `retCode 10016` ("svc error") failed a research fetch and the first fresh sync on 2026-10-02; public and signed requests now retry it with backoff like rate limits.

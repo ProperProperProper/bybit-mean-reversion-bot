@@ -22,7 +22,7 @@ There is one page per source file. Each page documents every function, type and 
 
 ## Current verification
 
-All audit findings are fixed ([audit.md](audit.md)). On real data the live strategy currently fails its walk-forward, so paper stays flat ([validation.md](validation.md)).
+Audit findings, their fixes and the remaining limitations are in [audit.md](audit.md). The live strategy is long-only CalmDip; its validation results and their limits are in [validation.md](validation.md). Paper trades only while the walk-forward gate allows.
 
 ## How it fits together
 

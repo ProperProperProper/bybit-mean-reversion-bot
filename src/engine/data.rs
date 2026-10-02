@@ -19,6 +19,9 @@ const BASE: &str = "https://api.bybit.com";
 const PACE: Duration = Duration::from_millis(70);
 
 pub struct Client {
+    // Test-only transport override; production always uses Bybit's fixed BASE.
+    #[cfg(test)]
+    test_base: Option<String>,
     http: reqwest::Client,
     last: tokio::sync::Mutex<tokio::time::Instant>,
 }
@@ -48,6 +51,8 @@ fn strict(v: &Value) -> Option<f64> {
 impl Client {
     pub fn new() -> Result<Self> {
         Ok(Client {
+            #[cfg(test)]
+            test_base: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(15))
@@ -57,7 +62,11 @@ impl Client {
     }
 
     async fn get(&self, path: &str, query: &str) -> Result<Value> {
-        let url = format!("{BASE}{path}?{query}");
+        #[cfg(not(test))]
+        let base = BASE;
+        #[cfg(test)]
+        let base = self.test_base.as_deref().unwrap_or(BASE);
+        let url = format!("{base}{path}?{query}");
         let mut err = anyhow!("{path}: no attempt");
         for attempt in 0..5u32 {
             {
@@ -1290,5 +1299,123 @@ mod gap_tests {
             vec![Some(3 * BAR_MS)],
             "launch rounded up to its first bar"
         );
+    }
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // NOTE(agents): This tests the actual public fetch/parser/pagination path.
+    // The local endpoint reproduces Bybit's start-only FIRST-page behavior.
+    // Fixture candles test transport coverage, not real prices or profitability.
+    #[tokio::test]
+    async fn fresh_fourteen_day_fetch_gets_all_1344_traded_and_mark_candles() {
+        let end = (chrono::Utc::now().timestamp_millis() / BAR_MS - 2) * BAR_MS;
+        let start = end - (BARS as i64 - 1) * BAR_MS;
+        for mark in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut buf = [0u8; 4096];
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buf[..n]);
+                        if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8(bytes).unwrap();
+                    let target = request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let (path, query) = target.split_once('?').unwrap();
+                    assert_eq!(
+                        path,
+                        if mark {
+                            "/v5/market/mark-price-kline"
+                        } else {
+                            "/v5/market/kline"
+                        }
+                    );
+                    let fields: std::collections::HashMap<_, _> = query
+                        .split('&')
+                        .map(|x| x.split_once('=').unwrap())
+                        .collect();
+                    assert_eq!(fields["start"].parse::<i64>().unwrap(), start);
+                    assert_eq!(fields["limit"], "1000");
+                    let requested_end = fields.get("end").map(|v| v.parse::<i64>().unwrap());
+                    requests.push(requested_end);
+                    let mut times: Vec<_> = (0..BARS).map(|i| start + i as i64 * BAR_MS).collect();
+                    if let Some(boundary) = requested_end {
+                        times.retain(|t| *t <= boundary);
+                        times.reverse();
+                        times.truncate(1000);
+                    } else {
+                        // Reproduce the bug: start-only yields the oldest 1000.
+                        times.truncate(1000);
+                        times.reverse();
+                    }
+                    let rows: Vec<_> = times
+                        .iter()
+                        .map(|ts| {
+                            serde_json::json!([
+                                ts.to_string(),
+                                "100",
+                                "101",
+                                "99",
+                                "100",
+                                "5",
+                                "500"
+                            ])
+                        })
+                        .collect();
+                    let body = serde_json::json!({"retCode":0,"result":{"list":rows}}).to_string();
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(body.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+                requests
+            });
+            let mut client = Client::new().unwrap();
+            client.test_base = Some(base);
+            client.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let fetched = if mark {
+                client.mark_range("BTCUSDT", start, end).await.unwrap()
+            } else {
+                // Empty-cache live sync uses since(), whose end is unbounded.
+                client.klines_since("BTCUSDT", start).await.unwrap()
+            };
+            assert_eq!(
+                fetched.len(),
+                BARS,
+                "must fetch the full window on the FIRST sync"
+            );
+            for (i, (ts, bar)) in fetched.iter().enumerate() {
+                assert_eq!(*ts, start + i as i64 * BAR_MS);
+                assert_eq!(bar.close, 100.0);
+            }
+            let requests = tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(requests[0].is_some_and(|t| t >= end));
+            assert_eq!(requests[1], Some(end - 999 * BAR_MS - 1));
+        }
     }
 }

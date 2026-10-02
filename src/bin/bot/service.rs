@@ -895,7 +895,7 @@ table{border-collapse:collapse;font-size:12px}td,th{padding:2px 8px;text-align:r
 <section><b>Next rebalance targets</b> <span class=k id=sighelp></span><table id=sig></table></section>
 <section><b>Live event log</b><pre id=ev></pre></section>
 <section><b>Recent paper trades</b><table id=tr></table></section>
-<section><b>Forward test, day by day</b> <span class=k>(historical simulation: settings chosen on the preceding 14 days, then tested on these 14 using the paper engine; current universe and execution measurements, simulated fills)</span><div id=fsum class=k></div><div id=fchart></div><table id=fdays></table></section>
+<section><b>Forward test, day by day</b> <span class=k>(historical simulation: settings chosen on the preceding 14 days, then tested on these 14 using the paper engine; current universe and execution measurements, simulated fills)</span><p class=k>Daily equity change includes realised and unrealised P&amp;L, fees and funding. Closed wins counts only profitable trades closed that day; equity can rise with zero closed wins.</p><div id=fsum class=k></div><div id=fchart></div><table id=fdays></table></section>
 <section><b>Walk-forward (14 days of 15m bars, re-run every bar)</b><pre id=wf></pre></section>
 <script>
 const f=(x,d=2)=>x==null||isNaN(x)?'-':Number(x).toFixed(d);
@@ -967,8 +967,8 @@ days.forEach((d,i)=>{const x=L+i*bw+bw*0.15,y=Math.min(by(d.pnl),by0),h=Math.abs
  if(i%2==0) g+=`<text x=${L+i*bw+bw/2} y=${H-6} text-anchor=middle fill=#888>${D(d.day_ts)}</text>`;});
 const sw=r.segments.length>1?days.findIndex(d=>d.day_ts>=r.segments[1].traded[0]-86400000):-1;
 if(sw>0) g+=`<line x1=${L+sw*bw+bw/2} x2=${L+sw*bw+bw/2} y1=${T} y2=${H-20} stroke=#b26a00 stroke-dasharray=3 /><text x=${L+sw*bw+bw/2+4} y=${T+24} fill=#b26a00>settings re-chosen</text>`;
-document.getElementById('fchart').innerHTML=g+`<text x=${L} y=${by0-bH/2-4} fill=#666>daily P&L USDT</text></svg>`;
-document.getElementById('fdays').innerHTML='<tr><th>Day (UTC)<th>P&L USDT<th>P&L %<th>Equity<th>Trades closed<th>Wins</tr>'+days.map(d=>`<tr><td>${new Date(d.day_ts).toISOString().slice(0,10)}<td class=${d.pnl>=0?'ok':'bad'}>${S(d.pnl)}<td class=${d.pnl>=0?'ok':'bad'}>${P(d.pnl_pct)}<td>${F(d.equity)}<td>${d.trades}<td>${d.wins}</tr>`).join('');
+document.getElementById('fchart').innerHTML=g+`<text x=${L} y=${by0-bH/2-4} fill=#666>daily equity change USDT (includes unrealised P&amp;L)</text></svg>`;
+document.getElementById('fdays').innerHTML='<tr><th>Day (UTC)<th>Equity change USDT<th>Equity change %<th>End-of-day equity<th>Trades closed<th>Closed wins</tr>'+days.map(d=>`<tr><td>${new Date(d.day_ts).toISOString().slice(0,10)}<td class=${d.pnl>=0?'ok':'bad'}>${S(d.pnl)}<td class=${d.pnl>=0?'ok':'bad'}>${P(d.pnl_pct)}<td>${F(d.equity)}<td>${d.trades}<td>${d.wins}</tr>`).join('');
 }catch(e){document.getElementById('fsum').textContent='chart error: '+e}}
 research();
 // NOTE(agents): Reload on process restart: the page embeds strategy labels and

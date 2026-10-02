@@ -11,6 +11,9 @@
 use bybit_mean_reversion_bot::engine::{research, scores, walkforward, xs, Market, BARS};
 use std::time::{Duration, Instant};
 
+// NOTE(agents): The research windows hold only today's top-50 coins (survivorship bias): long-only
+//               results here are inflated. Compare with the buy-and-hold lines, and use signal_ic
+//               for entry evidence.
 fn main() -> anyhow::Result<()> {
     let eq = research::start_equity()?;
     println!("start equity {eq} USDT");

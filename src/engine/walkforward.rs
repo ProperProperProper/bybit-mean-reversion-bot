@@ -32,6 +32,8 @@ pub const CANDIDATES: usize = 75;
 pub const MIN_IS_TRADES: usize = 8;
 pub const MIN_OOS_TRADES: usize = 8;
 pub const MAX_DRAWDOWN_PCT: f64 = 25.0;
+// NOTE(agents): These gates are the bot's safety rail. Changing a threshold to make a strategy pass
+//               defeats the purpose; report the failure instead.
 pub const MIN_PROFIT_FACTOR: f64 = 1.2;
 
 fn objective(m: &Metrics) -> f64 {
@@ -129,6 +131,9 @@ mod tests {
 
 use super::xs::{self, Regime, Signal, XsParams};
 
+// NOTE(agents): Keep the live grid small and its direction fixed by evidence (signal_ic), not by
+//               P&L. Widening it to hundreds of combinations selected noise in testing (every 'ALL'
+//               walk-forward failed).
 /// The paper strategy: long only, buying calm dips (`Signal::CalmDip`
 /// unflipped: the direction comes from the full-universe signal study in
 /// examples/signal_ic.rs, not from P&L). The walk-forward picks the hold,
@@ -276,6 +281,8 @@ pub struct WfReport<P> {
 pub type XsReport = WfReport<XsParams>;
 
 impl<P> WfReport<P> {
+    // NOTE(agents): Only the profit-factor and best-window gates may be missed here; never drop the
+    //               liquidation, drawdown or final-profit conditions.
     /// Weaker than `passed`: out-of-sample profitable with no liquidations, every
     /// window found params, final params survive the 14 days, but the profit
     /// factor gate may be missed. Paper keeps forward-testing in this state.

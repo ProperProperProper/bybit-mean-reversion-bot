@@ -12,12 +12,20 @@ use super::{Market, Side, BAR_MS};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+// NOTE(agents): User requirement: below 5 USDT free (after margin committed ANYWHERE on the real
+//               account, see `reserved`) nothing is opened or added; exits always run. Checked once
+//               per rebalance and per add, not per leg, or a 10 USDT account could never open its
+//               second leg.
 /// No new position or add is placed while the free balance (after every
 /// posted margin, including margin other positions hold on the real account)
 /// is below this many USDT.
 pub const MIN_ENTRY_BALANCE: f64 = 5.0;
 /// Long and short gross notional may differ by at most this fraction.
 pub const NEUTRAL_TOLERANCE: f64 = 0.02;
+// NOTE(agents): Slots are sized at the decision close from marked equity; closing the old positions
+//               costs fees and book cost before the new ones fill. Without this headroom the last
+//               leg didn't fit and the whole rebalance was rejected (919 times in 192 real-data
+//               runs).
 /// Share of the free balance a rebalance commits: the rest covers closing the
 /// outgoing positions (fees, book cost) between the decision and the fill.
 const SLOT_HEADROOM: f64 = 0.99;
@@ -43,6 +51,10 @@ pub enum Signal {
     /// Average hourly funding rate of the last 3 settlements (unflipped = carry:
     /// long the most negative, short the most positive, paid on both legs).
     Funding,
+    // NOTE(agents): The live entry signal. It passed a pre-registered holdout (docs/validation.md,
+    //               commits 5329e48/6988079). That holdout is now spent: do NOT re-tune CalmDip's
+    //               definition on windows -3..0. Any change needs a fresh pre-registered holdout
+    //               (windows before 2026-06-25).
     /// Mean of the volatility and 24h-return percentiles (unflipped = long the
     /// calmest coins that fell most). Both effects held in every research
     /// window on the full historical universe (examples/signal_ic.rs).
@@ -67,6 +79,9 @@ pub struct XsParams {
     /// Drawdown handling (all off by default; see `Risk`).
     #[serde(default)]
     pub risk: Risk,
+    // NOTE(agents): The user wants LONG ONLY live. Market-neutral (long_only = false) stays for
+    //               research comparison only; shorting the strongest coins got squeezed into
+    //               liquidations on real data.
     /// Long only: hold the `top` lowest values (after `flip`), never short.
     #[serde(default)]
     pub long_only: bool,
@@ -88,6 +103,9 @@ pub enum Regime {
 /// 24 hours of 15m bars: the BTC trend filter's averaging window.
 pub const REGIME_BARS: usize = 96;
 
+// NOTE(agents): Missing BTC history returns false (no entries) on purpose: never guess market
+//               state. The BTC filter is NOT covered by the CalmDip holdout proof; it is the only
+//               market-timing element.
 /// Whether `r` allows entries at bar t. A missing BTC history blocks entries.
 pub fn regime_allows(m: &Market, t: usize, r: Regime) -> bool {
     match r {
@@ -347,6 +365,9 @@ fn ranked_targets(
                     let cost = r.book_cost(notional, side == Side::Long)?;
                     let price = bar.close * (1.0 + side.sign() * cost * cm);
                     let qty = r.order_qty(notional / price, price)?;
+                    // NOTE(agents): Keep this check at decision time with the SAME budget the fill
+                    //               will use (`pending_slot`); checking a different size let
+                    //               rounding unbalance fills.
                     // Lot rounding must not unbalance the legs: a contract whose
                     // step is coarse for this slot size cannot be held neutrally.
                     if qty * price < notional * (1.0 - NEUTRAL_TOLERANCE / 2.0)
@@ -374,6 +395,9 @@ fn ranked_targets(
     out
 }
 
+// NOTE(agents): Balance-aware sizing for every account size: tries the configured basket, then
+//               smaller ones, until each slot passes the real lot, minimum, depth and leverage
+//               checks. Returns the slot budget so execution reuses it exactly.
 /// Reduce the basket until the balance can fund the contracts' actual lot rules.
 fn funded_targets(
     m: &Market,
@@ -530,6 +554,9 @@ impl XsPortfolio {
         }
     }
 
+    // NOTE(agents): Bybit rule: funding is valued at the MARK price and debited from free balance
+    //               first, then the isolated margin, which moves the liquidation price. Never value
+    //               it at traded prices.
     /// Funding consumes free cash first, then this position's isolated margin.
     fn charge_funding(&mut self, m: &Market, i: usize, ts: i64, rate: f64, mark: f64) {
         if self.positions[i].last_funding_ts == Some(ts) {
@@ -567,6 +594,9 @@ impl XsPortfolio {
         }
     }
 
+    // NOTE(agents): User requirement: delisted/delisting tokens are hard-excluded. The service
+    //               calls this AFTER replaying missed bars so the exit fills at the next open,
+    //               never at a replayed (historical) bar.
     /// Queue an exit at the next open for every held token not in `trading`
     /// (Bybit's tokens that trade with no delisting scheduled). Returns them.
     pub fn exit_delisting(&mut self, trading: &std::collections::HashSet<String>) -> Vec<String> {
@@ -751,6 +781,10 @@ impl XsPortfolio {
             if self.execution_error.is_some() {
                 return;
             }
+            // NOTE(agents): Order matters. Funding at this open, then mark-price gap liquidation,
+            //               THEN queued stops/exits/adds. Reordering lets a queued stop book a loss
+            //               beyond the isolated margin with zero liquidations (old audit finding
+            //               1).
             // Gap liquidation precedes every queued discretionary action.
             if self.positions[i].side.sign() * (mark - self.positions[i].liquidation) <= 0.0 {
                 self.liquidate(i, ts);
@@ -832,6 +866,9 @@ impl XsPortfolio {
             } else if let Some(target) = self.pending_targets.take() {
                 let execution = self.pending_params.take().unwrap_or_else(|| p.clone());
                 let p = &execution;
+                // NOTE(agents): Positions are always fully closed and reopened at a rebalance (no
+                //               partial keep); simpler and keeps every leg at the decided slot
+                //               size.
                 // Every position closes so both sides are re-sized to neutral.
                 let mut i = 0;
                 while i < self.positions.len() {
@@ -905,6 +942,9 @@ impl XsPortfolio {
                         .map(|p| p.qty * p.entry)
                         .sum::<f64>();
                     let gross = long + short;
+                    // NOTE(agents): All legs or none: a partial fill would leave an unintended
+                    //               basket (one-sided when market-neutral). Fills are simulated on
+                    //               a clone and committed only if complete.
                     if candidate.positions.len() == target.len()
                         && gross > 0.0
                         && (p.long_only || (long - short).abs() / gross <= NEUTRAL_TOLERANCE)
@@ -998,6 +1038,9 @@ impl XsPortfolio {
         let end = ts + BAR_MS;
         for i in 0..self.positions.len() {
             let sym = self.positions[i].sym;
+            // NOTE(agents): Do not turn this back into an error: the live market always loads
+            //               funding stamped at the newest close, whose mark price (next open)
+            //               doesn't exist yet. Erroring here permanently stopped the paper account.
             // The newest loaded bar's closing settlement is charged when the next
             // bar (and its real mark open) is processed.
             if t + 1 == m.ts.len() {
@@ -1038,6 +1081,9 @@ impl XsPortfolio {
         }
     }
 
+    // NOTE(agents): Decisions use only data up to bar t and fill at a later open
+    //               (`defer_new_decisions` live). Targets, parameters and slot budget are frozen
+    //               here; `install_entry_gate` cancels them if the settings or the gate change.
     /// Queue a decision using only information available at this close.
     pub fn decide_close(
         &mut self,

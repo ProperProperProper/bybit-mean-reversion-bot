@@ -2,6 +2,16 @@
 
 Last updated 2026-10-02 by Claude Code. Read this before changing anything.
 
+## Notes in the code
+
+Every place where a change could quietly break a requirement or an accounting rule carries a `NOTE(agents):` comment explaining the invariant and why it exists. Read them before editing a file:
+
+```sh
+grep -rn "NOTE(agents)" src examples deploy.sh
+```
+
+Keep them current: if you change the behaviour a note describes, update or remove the note in the same commit.
+
 ## What the user wants
 
 - **Long only.** The live strategy is long-only. Do not bring back shorts or the market-neutral mode as the live strategy unless the user asks.

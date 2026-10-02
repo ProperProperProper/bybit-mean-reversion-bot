@@ -68,6 +68,8 @@ pub struct Market {
     /// Held symbols outside the current top 50 remain managed but cannot re-enter.
     pub entry_eligible: Vec<bool>,
     pub bars: Vec<Vec<Option<Bar>>>,
+    // NOTE(agents): Funding and liquidation must use these MARK candles; traded candles are for
+    //               fills only. Never copy traded prices in when a mark candle is missing.
     /// Exchange mark-price OHLC. Never substitute traded prices in production.
     pub marks: Vec<Vec<Option<Bar>>>,
     /// Real settled funding (timestamp ms, rate) per symbol, ascending.
@@ -100,6 +102,8 @@ impl Market {
         Ok(())
     }
 
+    // NOTE(agents): Per-symbol on purpose: the service lets an incomplete coin sit out a bar
+    //               instead of failing the whole market.
     /// One symbol's rows: complete traded and mark candles after listing, sane
     /// OHLC, ascending finite funding.
     pub fn validate_symbol(&self, s: usize) -> anyhow::Result<()> {

@@ -9,6 +9,8 @@ RUNTIME="$HOME/Library/Application Support/BybitMeanReversionBot"
 LABEL="com.bybitmeanreversion.bot"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 # Signing identifier the existing LuLu allow rule for $RUNTIME/bin/bot expects.
+# NOTE(agents): Do not change SIGN_ID or remove the codesign step: LuLu's allow rule matches it, and
+#              the bot would hang on a firewall prompt while unattended.
 SIGN_ID="bot-06c819130362ed6a"
 
 cd "$REPO"

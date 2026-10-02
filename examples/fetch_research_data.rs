@@ -12,6 +12,9 @@ use bybit_mean_reversion_bot::engine::{research, BAR_MS};
 use futures_util::{stream, StreamExt};
 use std::collections::HashSet;
 
+// NOTE(agents): Holdout windows (k <= 0) are for pre-registered tests only. This binary's path has
+//               a LuLu allow rule; a new network binary would hang on a firewall prompt while the
+//               user is away.
 /// `HOLDOUT=k,k,...`: traded candles only (what the signal study needs) for
 /// windows `k` (`research::window_bounds`, e.g. -3..0 = before window 1) into
 /// `holdout/window_k.db`, for every USDT perpetual token trading today with no

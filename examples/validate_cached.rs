@@ -41,6 +41,8 @@ fn outcome(pf: &xs::XsPortfolio) -> Value {
         "funding":pf.trades.iter().map(|t|t.funding).sum::<f64>()})
 }
 
+// NOTE(agents): Run on sqlite3 '.backup' copies, never on the live runtime files (WAL mode; the
+//               service writes them every bar).
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     ensure!(

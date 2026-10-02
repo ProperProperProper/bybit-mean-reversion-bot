@@ -105,6 +105,9 @@ fn legacy_version() -> u32 {
     1
 }
 
+// NOTE(agents): Never silently reset the paper account: a missing file is a first run, anything
+//               unreadable or invalid stops the service. To migrate state, write an explicit
+//               migration, not a fallback.
 fn load_paper(path: &Path) -> Result<Option<PaperState>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -145,6 +148,10 @@ fn persist_paper(path: &Path, state: &PaperState) -> Result<()> {
     Ok(())
 }
 
+// NOTE(agents): Causality order: (1) replay missed bars with the PREVIOUS settings, (2) apply what
+//               was observed now (wallet change, committed margin, delisting exits), (3) install
+//               new settings and decide at the latest close. Anything learned now must never change
+//               a replayed bar.
 /// Replay only contiguous unseen bars with the previously known settings.
 /// Later balance observations and reports must not resize historical orders.
 fn advance_paper(
@@ -437,6 +444,8 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // their full Bybit rules: order rules, the account's fees, margin tiers,
         // measured books. The universe is the top 50 with complete rules.
         let lots = app.client.usdt_perpetual_lots().await?;
+        // NOTE(agents): The only list of tradeable tokens. Held tokens missing from it get a
+        //               Delisting exit, and their data is purged once they are no longer held.
         // Tokens trading with no delisting scheduled: everything else is
         // hard-excluded (never entered, held ones exit, stored rows deleted).
         let trading: std::collections::HashSet<String> =
@@ -465,6 +474,8 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // mirrored; margin committed elsewhere on the account is reserved).
         let account = app.client.usdt_account(&app.creds).await?;
         let balance = account.wallet;
+        // NOTE(agents): Universe = top 50 by 24h turnover among the top 75 that have complete Bybit
+        //               rules (user requirement: drop coins without margin data).
         let lots = data::universe(
             &candidates,
             &app.cache.rules_symbols()?,
@@ -491,6 +502,8 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             }
         }
         symbols.sort();
+        // NOTE(agents): Keep held symbols until they are closed, so the exit has real prices;
+        //               everything else not trading is deleted.
         // Purge every stored row of tokens that are neither trading nor held.
         let keep: std::collections::HashSet<String> =
             trading.iter().chain(&symbols).cloned().collect();
@@ -509,6 +522,8 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         }
         let sync_secs = t0.elapsed().as_secs_f64();
         let mut market = app.cache.market(&symbols, last)?;
+        // NOTE(agents): Skipping is fine for coins we don't hold. A HELD coin with incomplete data
+        //               must fail the bar: never mark, fund or close a position on missing prices.
         // A symbol whose real data is incomplete this bar (a sync failure or an
         // exchange gap) sits out; a held one must be complete or the bar fails.
         let incomplete: Vec<(String, String)> = (0..market.symbols.len())
@@ -547,6 +562,9 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         }
         let market = Arc::new(market);
         hb.beat();
+        // NOTE(agents): Size the walk-forward from the FREE balance (minus margin committed
+        //               elsewhere), like the live sizing, so the gate judges the account that would
+        //               really trade.
         // The walk-forward sizes from the money actually in play: the paper
         // account's equity (which follows the real balance), else the real balance.
         let wf_equity = (app
@@ -621,6 +639,9 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                     &market,
                     &sc,
                     &p,
+                    // NOTE(agents): Entry gate: new paper positions only on PASSED or FORWARD TEST.
+                    //               Don't loosen the gate to get trades; open positions are still
+                    //               managed when it is closed.
                     report.passed || report.forward_ok(),
                     chrono::Utc::now().timestamp_millis(),
                     Some((account, &trading)),

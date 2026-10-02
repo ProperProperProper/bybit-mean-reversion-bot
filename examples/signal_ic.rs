@@ -71,6 +71,9 @@ fn tstat(v: &[f64]) -> f64 {
     }
 }
 
+// NOTE(agents): Returns run from the NEXT open (the earliest fill) and are taken relative to the
+//               universe average, so market moves cancel. Samples step by h, so holds never overlap
+//               and t-stats aren't inflated.
 fn measure(m: &Market, sc: &[Vec<Option<scores::Score>>], p: &xs::XsParams, h: usize) -> Stat {
     let mut st = Stat {
         ic: vec![],
@@ -110,6 +113,10 @@ fn measure(m: &Market, sc: &[Vec<Option<scores::Score>>], p: &xs::XsParams, h: u
     st
 }
 
+// NOTE(agents): This is how entry signals get proven. Workflow: explore on research windows, then
+//               commit the exact signal and pass criteria (pre-register) BEFORE fetching a fresh
+//               holdout, then run once with SIGNAL= set. Never iterate on a holdout; once used it
+//               is spent.
 fn main() -> anyhow::Result<()> {
     let historical = std::env::args().nth(1).map(std::path::PathBuf::from);
     let dir = historical

@@ -59,6 +59,8 @@ struct Raw {
     pulse: Option<(f64, f64)>,
 }
 
+// NOTE(agents): Strictly causal: bar t uses bars <= t only, and a gap restarts the warm-up. Tests
+//               check future-bar invariance; keep them passing for any new feature.
 /// Per-symbol raw features; None until WARMUP contiguous bars exist.
 fn raw_features(bars: &[Option<Bar>]) -> Vec<Option<Raw>> {
     let n = bars.len();
@@ -203,6 +205,8 @@ pub fn compute(m: &Market, universe: usize) -> Vec<Vec<Option<Score>>> {
     compute_with(m, universe, true)
 }
 
+// NOTE(agents): tradeable_only = false is for research only (signal_ic on broad historical data).
+//               The live bot must use `compute`, which only ranks coins with Bybit rules.
 /// `compute`, optionally ranking every symbol that traded at the time whether
 /// or not it has rules today: research on the universe as it was then, free
 /// of today's survivors (`examples/signal_ic.rs`).

@@ -63,6 +63,8 @@ impl Rules {
         (q > 0.0 && q >= self.min_qty && q * price >= self.min_notional).then_some(q)
     }
 
+    // NOTE(agents): Half the measured depth is kept free so the position can be closed; don't raise
+    //               it to fit bigger orders. Large balances keep cash instead.
     /// Leave half of the measured book capacity as a closing-liquidity reserve.
     /// Large balances keep unallocated cash instead of assuming infinite depth.
     pub fn order_notional_cap(&self, reference: f64) -> Option<f64> {
@@ -70,6 +72,8 @@ impl Rules {
         Some((depth * 0.5).min(self.max_market_qty * reference))
     }
 
+    // NOTE(agents): Beyond measured depth this returns None (no fill). Never extrapolate: the old
+    //               linear extrapolation produced negative exit prices.
     /// Market-order cost (fraction of price) for `notional` USDT, buying or
     /// selling, interpolated between measured sizes; None if the measured book
     /// was too thin for that size.
@@ -103,6 +107,9 @@ impl Rules {
         None
     }
 
+    // NOTE(agents): Isolated-margin model on Bybit's real tiers (rate + deduction) plus a
+    //               closing-fee reserve, triggered by mark prices. It is a model, not Bybit's
+    //               engine; tests check the equation at tier boundaries.
     /// Isolated-margin simulation threshold with the actual tier deduction and
     /// a closing-fee reserve. Mark prices trigger this threshold; this is not a
     /// model of Bybit's unified/cross-margin account engine.

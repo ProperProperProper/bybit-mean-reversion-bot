@@ -32,6 +32,8 @@ pub struct LotFilter {
     pub max_market_qty: f64,
 }
 
+// NOTE(agents): User requirement: real data only. Never add a fallback/default value for a missing
+//               Bybit field; drop the row, skip the symbol, or fail.
 /// A number Bybit sent (string or number); None if missing or unparsable,
 /// never a default.
 fn strict(v: &Value) -> Option<f64> {
@@ -138,6 +140,9 @@ impl Client {
         Ok(out)
     }
 
+    // NOTE(agents): Ranks CANDIDATES (75); the traded universe is `universe()` = the top 50 of
+    //               those with complete rules. Don't rank straight to 50: coins without
+    //               margin/rules data must drop out and the next coin take their place.
     /// Current top margin-eligible token perpetuals by public 24h turnover.
     pub async fn top_margin_tokens(
         &self,
@@ -247,6 +252,8 @@ impl Client {
             .collect())
     }
 
+    // NOTE(agents): Read-only. `committed` covers margin used by OTHER positions/orders on the same
+    //               real account (e.g. another bot); it is reserved and never sized against.
     /// The real account's USDT wallet and the part of it already committed to
     /// open positions, open orders and locks (read-only).
     pub async fn usdt_account(&self, creds: &Credentials) -> Result<AccountBalance> {
@@ -264,6 +271,8 @@ impl Client {
         parse_account(coin)
     }
 
+    // NOTE(agents): GET only; this bot must never place, amend or cancel orders. Retries re-sign
+    //               each attempt (the timestamp is part of the signature).
     /// Signed GET (Bybit v5: HMAC-SHA256 of timestamp + key + recv_window + query),
     /// re-signed and retried like `get` on network errors and rate limits.
     async fn signed_get(&self, creds: &Credentials, path: &str, query: &str) -> Result<Value> {
@@ -321,6 +330,9 @@ impl Client {
         Err(err)
     }
 
+    // NOTE(agents): A refresh REPLACES the stored snapshot (put_rules). The half-coverage guard
+    //               below stops an API change from wiping every symbol's rules; an mmDeduction
+    //               parsing bug once produced rules for 0 of 50.
     /// Full Bybit rules for every symbol that has all of them: order rules, the
     /// account's taker fee, margin tiers and a freshly measured order book.
     /// Symbols missing any piece are left out (never traded).
@@ -523,6 +535,8 @@ impl Client {
     }
 }
 
+// NOTE(agents): Bybit sends mmDeduction = "" for every lowest tier and for whole symbols (QNT, LIT,
+//               STX, DOT on 2026-10-01). Treating "" as invalid rejected every symbol.
 /// One maintenance-margin tier and its published deduction. Bybit sends an
 /// empty `mmDeduction` for every lowest tier and for whole symbols on some
 /// risk-limit tables; any other missing or garbled field invalidates the tier.
@@ -543,6 +557,9 @@ fn parse_tier(t: &Value) -> Option<(MarginTier, Option<f64>)> {
     ))
 }
 
+// NOTE(agents): Derived, not assumed: this formula matched Bybit's published deductions exactly on
+//               every tier of BTC/ETH/SOL/DOGE. If Bybit ever publishes a disagreeing value, the
+//               symbol is rejected rather than trusted either way.
 /// Tiered maintenance margin is continuous at every tier boundary, which fixes
 /// each deduction: d[i] = d[i-1] + limit[i-1] * (rate[i] - rate[i-1]). Bybit's
 /// published values equal this exactly (BTC/ETH/SOL/DOGE, 2026-10-01); a
@@ -564,6 +581,9 @@ fn with_deductions(mut tiers: Vec<(MarginTier, Option<f64>)>) -> Option<Vec<Marg
     Some(out)
 }
 
+// NOTE(agents): The single definition of an eligible contract. Together with status Trading and
+//               deliveryTime == 0 in usdt_perpetual_lots it hard-excludes stocks, ETFs, forex,
+//               commodities, pre-listings and delisted/delisting tokens (user requirement).
 /// A USDT linear perpetual on a crypto token: no stock, ETF, forex or
 /// commodity contract (those carry an underlying ticker or another symbol
 /// type), and not a pre-listing.
@@ -731,6 +751,9 @@ impl Cache {
         self.first_missing("marks", symbol, earliest, last)
     }
 
+    // NOTE(agents): Only for symbols listed INSIDE the window. For older symbols a missing leading
+    //               candle is a real gap and must stay an error; never infer listing from cached
+    //               data.
     /// `fetched` is Bybit's complete traded history from `since`. When `since` is
     /// the listing boundary of a symbol listed inside the window and Bybit's
     /// first candle comes later, trading began there: record it.
@@ -829,6 +852,9 @@ impl Cache {
         })
     }
 
+    // NOTE(agents): User requirement: delisted tokens must not remain in ANY database (live,
+    //               research, holdout, backups). Do not add a table with a symbol column without
+    //               adding it to TABLES.
     /// Delete every stored row (candles, marks, funding, rules, listing data,
     /// universe) of symbols not in `keep`: delisted tokens never stay in the
     /// data. Returns how many symbols were removed.
@@ -893,6 +919,9 @@ impl Cache {
         })
     }
 
+    // NOTE(agents): Funding is loaded up to last_ts + BAR_MS (the newest close); xs::step defers
+    //               that settlement to the next bar. Missing candles stay None: validate_symbol
+    //               decides whether a symbol may be used.
     /// Market of exactly BARS bars ending at `last_ts` for `symbols`.
     pub fn market(&self, symbols: &[String], last_ts: i64) -> Result<Market> {
         let first = last_ts - (BARS as i64 - 1) * BAR_MS;
@@ -938,6 +967,8 @@ impl Cache {
     }
 }
 
+// NOTE(agents): Up to 20% of symbols may fail per bar; they sit out (service skips incomplete
+//               symbols unless held). Keep it tolerant: one exchange gap used to stall every bar.
 /// Bring the cache up to date for all symbols (incremental, up to 6 requests in
 /// flight, globally paced), returning the last fully closed bar timestamp. A
 /// symbol that fails is skipped for this bar; more than 20% failing is an error.

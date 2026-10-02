@@ -14,6 +14,8 @@ pub struct Credentials {
     pub api_secret: String,
 }
 
+// NOTE(agents): Credentials stay in memory only: never log, print, write or commit them. The repo
+//               is public.
 /// Reads the JSON `{"api_key": ..., "api_secret": ...}` stored as a generic password.
 pub fn load() -> Result<Credentials> {
     let out = Command::new("/usr/bin/security")

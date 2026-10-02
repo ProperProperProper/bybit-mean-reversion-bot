@@ -1,11 +1,57 @@
 # Validation — 2 October 2026
 
+## Long-only strategy (current live)
+
+The user moved the bot to long only and asked for better entry signals. Both sections below use real Bybit data and the observed balance (about 110 USDT). The market-neutral results further down are kept for reference.
+
+### Entry evidence on the full historical universe (`signal_ic`)
+
+The research windows hold only today's top-50 coins. Today's top-turnover coins are often the ones that just rallied, so long-only results on them are inflated (window 3: holding every coin equally made +47.1%, BTC +9.1%). The entry study therefore uses the pre-refetch windows, which hold candles for every perpetual that traded then (741–782 coins). The universe is the top 50 by turnover **at each bar**, with non-overlapping holds.
+
+| Signal (lowest bought) | IC, 4h hold (W1/W2/W3) | IC, 8h hold | IC, 24h hold | 5 bought vs average coin, 24h hold |
+|---|---|---|---|---|
+| Volatility | −0.077 / −0.071 / −0.039 | −0.120 / −0.100 / −0.061 | −0.123 / −0.217 / −0.132 | +0.38% / +0.58% / −0.44% |
+| 24h return (reversal) | −0.042 / −0.027 / −0.049 | −0.038 / −0.020 / −0.064 | −0.049 / −0.058 / −0.038 | −0.72% / −0.74% / −1.37% |
+| **CalmDip** (both) | −0.072 / −0.057 / −0.050 | −0.089 / −0.076 / −0.076 | −0.093 / −0.183 / −0.107 | **+1.03% / +0.24% / +0.23%** |
+| Pulse, buying the highest | — | — | — | −2.22% / −1.37% / −1.06% |
+
+A negative IC means lower values did better, which is the direction CalmDip buys. CalmDip's IC is negative in all 9 cells, with t-stats from −1.9 to −4.1. It was designed after seeing these windows, so only new data can confirm it. Pulse momentum, which looks good on today's top 50, lost to the average coin in every window on the full universe.
+
+### Holdout test of CalmDip (pre-registered 2026-10-02, before any holdout data was fetched)
+
+CalmDip was designed on the three research windows, so they cannot prove it. The proof attempt uses earlier 14-day windows nobody has looked at: `window_bounds(k)` for k = −3 … 0 (2026-07-09 → 2026-08-20 08:30 UTC, four windows). The universe is every USDT perpetual token that was trading then, **including since-delisted ones** (`instruments-info` status `Trading` and `Closed`), ranked to the top 50 by turnover at each bar. The signal is exactly as defined in this commit (unflipped, the 5 lowest bought). Nothing is tuned afterwards.
+
+**Pass criteria (all required):**
+1. The IC (rank correlation with next-open-to-close return relative to the average coin) is negative in **every** holdout window at both the 8h and 24h holds.
+2. The pooled IC t-stat across all holdout samples is ≤ −2 at both holds.
+3. Pooled over all holdout windows, the 5 coins bought beat the average coin by more than 0.2% per trade at the 24h hold (an estimate of round-trip taker fees plus book cost).
+
+If any criterion fails, CalmDip is **not** a proven edge, and this document will say so.
+
+### Walk-forward of the live grid (long-only CalmDip, 32 combinations)
+
+| Data | Verdict | OOS return | Profit factor | Trades | Liquidations |
+|---|---|---|---|---|---|
+| Latest 14 days | fail (rests on one window) | +13.1% | 1.65 | 41 | 0 |
+| Window 1 | **pass** | +1.6% | 1.37 | 21 | 0 |
+| Window 2 | fail | −1.8% | 0.76 | 23 | 0 |
+| Window 3 | fail (rests on one window) | +1.2% | 1.11 | 22 | 0 |
+
+| Forward test | Return | At 2× costs | Max drawdown | Buy-and-hold, equal-weight universe |
+|---|---|---|---|---|
+| Window 1 → 2 | −9.8% | −12.5% | 10.0% | +5.9% |
+| Window 2 → 3 | +21.9% | +19.3% | 4.8% | +47.1% |
+
+Long only is better than the old market-neutral Pulse (no liquidations, shallower drawdowns), but it trails simply holding the universe, so it is **not a proven edge**. The paper account is the forward test on new data.
+
+## Market-neutral strategy (previous live, for reference)
+
 All numbers come from real Bybit data: closed 15-minute traded and mark-price candles, settled funding, current order books, risk tiers, lot filters and this account's fee rates. They were run on disposable copies of the service's databases, from the account's observed balance (about **110 USDT**).
 
 ## Tests
 
 ```sh
-cargo test --release --all-targets   # 59 tests, all pass
+cargo test --release --all-targets   # 62 tests, all pass
 cargo clippy --all-targets -- -D warnings   # clean
 ```
 

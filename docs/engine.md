@@ -40,7 +40,7 @@ All symbols on one shared timeline of closed bars:
 | `bars[s][t]` | `Some(Bar)`, or `None` when the symbol has no bar at `ts[t]` (not listed yet, or a gap). |
 | `marks[s][t]` | Bybit mark-price candle, used for funding valuation and liquidation. Never substituted by traded prices. |
 | `listing_times[s]` | Start of the symbol's data (launch or first trade, ms). `None` = unverified, which fails validation. |
-| `entry_eligible[s]` | In the current top-50 universe. Held symbols outside it stay managed but are not ranked. |
+| `entry_eligible[s]` | In the current top-20 universe. Held symbols outside it stay managed but are not ranked. |
 | `funding[s]` | Real settled funding `(timestamp, rate)`, ascending. |
 | `rules[s]` | The symbol's Bybit trading rules (see [rules.md](rules.md)). `None` means the symbol is never traded. |
 

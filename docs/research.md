@@ -1,6 +1,6 @@
 # `src/engine/research.rs`: research windows and start equity
 
-Status (3 October 2026): configured for the top 20 only. Research windows must be deleted and refetched for this configuration; earlier top-50 results do not validate it.
+Status (3 October 2026): configured for the top 20 only. The windows are deleted and refetched for the current top 20 at every fresh-data reset; earlier top-50 results do not validate this configuration.
 
 The three fixed, back-to-back 14-day windows of real Bybit data used for strategy selection. `examples/fetch_research_data.rs` stores them in the runtime folder.
 

@@ -1,6 +1,6 @@
 # `src/engine/xs.rs`: the strategy engine
 
-A cross-sectional portfolio over the top-50 token USDT perpetuals. At aligned rebalance closes it ranks the universe by a `Signal`, then holds **long the `top` lowest values**, plus, unless `long_only`, **short the `top` highest** (market-neutral), equal notional per leg. The live strategy is long only. The same `step` function drives backtests, the walk-forward and paper trading, so there is no separate "live logic". Audit history: [audit.md](audit.md).
+A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned rebalance closes it ranks the universe by a `Signal`, then holds **long the `top` lowest values**, plus, unless `long_only`, **short the `top` highest** (market-neutral), equal notional per leg. The live strategy is long only. The same `step` function drives backtests, the walk-forward and paper trading, so there is no separate "live logic". Audit history: [audit.md](audit.md).
 
 ## Constants
 

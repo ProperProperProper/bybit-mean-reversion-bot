@@ -19,8 +19,8 @@ Then the **final settings** are chosen on the most recent 8 days. Those are what
 | Name | Value | Meaning |
 |---|---|---|
 | `IS_BARS`, `OOS_BARS`, `WINDOW_STARTS` | 768, 192, [0, 192, 384] | The rounds above |
-| `UNIVERSE` | 50 | Top 50 token USDT perpetuals by 24h turnover with complete Bybit rules |
-| `CANDIDATES` | 75 | Coins measured for rules each refresh, so ones without complete rules can be replaced |
+| `UNIVERSE` | 20 | Top 20 token USDT perpetuals by 24h turnover with complete Bybit rules (user request, 2026-10-03) |
+| `CANDIDATES` | `UNIVERSE` (20) | Coins measured for rules each refresh: only the top 20; a coin without complete rules shrinks the universe instead of being replaced |
 | `MIN_IS_TRADES`, `MIN_OOS_TRADES` | 8, 8 | Settings must actually trade |
 | `MAX_DRAWDOWN_PCT` | 25 | Drawdown cap |
 | `MIN_PROFIT_FACTOR` | 1.2 | Out-of-sample profit-factor gate |

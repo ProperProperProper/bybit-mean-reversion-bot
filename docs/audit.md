@@ -2,7 +2,7 @@
 
 This page tracks every finding from the 1 October audit and the follow-up audit of 2 October, with its current state in the code. "Fixed" means the code changed and a regression test covers it; the test is named. Everything listed is in the committed tree, which was deployed with a fresh-data reset on 2026-10-02.
 
-The earlier findings have fixes, with the additional qualifications below. With them fixed, the old market-neutral Pulse strategy failed its validation on real data. The live strategy is now long-only CalmDip, whose entry signal met pre-registered out-of-sample thresholds as a **relative** edge; the full strategy passes its walk-forward on 1 of 4 data sets ([validation.md](validation.md)). Paper trades only while the walk-forward gate allows.
+The earlier findings have fixes, with the additional qualifications below. With them fixed, the old market-neutral Pulse strategy failed its validation on real data. The live strategy is now long-only CalmDip, whose entry signal met pre-registered out-of-sample thresholds as a **relative** edge; the full strategy passes its walk-forward on 1 of 4 data sets ([validation.md](validation.md)). Since 2026-10-03 paper trades the best settings that pass the two safety rules; the walk-forward check is information, not a gate.
 
 ## Findings from the 1 October audit
 
@@ -22,7 +22,7 @@ The earlier findings have fixes, with the additional qualifications below. With 
 | 12 | Thin-book extrapolation invented negative exit prices | Fixed: a close outside measured depth invalidates the simulation instead of inventing a fill | `exit_price` |
 | 13 | Missing candles consumed queued entries | Fixed: the rebalance waits for the bar with data, using the parameters captured at the decision | `paired_entries_wait_for_missing_candle_and_use_captured_parameters` |
 | 14 | Leading gaps were indistinguishable from pre-listing time | Fixed: Bybit `launchTime` is stored; see also new finding D below | `incremental_sync_retries_internal_gaps_and_missing_tail` |
-| 15 | The forward gate admitted losing final settings | Fixed: `forward_ok` requires final full-period profit | `walkforward::forward_ok` |
+| 15 | The forward gate admitted losing final settings | Fixed then; superseded 2026-10-03: `forward_ok` was removed when the walk-forward stopped gating paper (user design: champion/challenger with two safety rules) | `walkforward::choose_live` |
 | ops | `deploy.sh` reported success after failed bootstrap | Fixed: it exits non-zero | `deploy.sh` |
 | ops | Funding pagination stopped after a malformed record | Fixed: a malformed record fails the request | `funding_range` |
 | ops | Dashboard "last update" masked a stalled loop | Fixed: it shows the last processed bar | console |

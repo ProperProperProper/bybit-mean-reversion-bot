@@ -79,9 +79,10 @@ impl Health {
         f(e)
     }
 
-    // NOTE(agents): bar_task's stall limit (20 min) must stay above the walk-forward deadline (15
-    //               min, service::WF_DEADLINE), or a long walk-forward gets killed mid-run every
-    //               bar.
+    // NOTE(agents): A task cannot beat while it awaits a spawn_blocking job, so its stall limit
+    //               must exceed that job's deadline: search_task uses SEARCH_DEADLINE + 10 min
+    //               (service.rs), or a long search gets killed mid-run. bar_task no longer runs
+    //               the search.
     /// Spawn `make_task` under supervision. The task must call `hb.beat()` at
     /// least every `stall_after`, or it is treated as hung and restarted.
     pub fn spawn<F, Fut>(&self, name: &str, stall_after: Duration, make_task: F)

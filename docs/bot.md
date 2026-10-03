@@ -15,7 +15,9 @@ Paper trading and signals only. It never places orders.
 |---|---|---|
 | `PORT` | 8787 | Console, bound to 127.0.0.1 |
 | `RULES_REFRESH` | 1 h | Re-measure fees, margin tiers and order books |
-| `WF_DEADLINE` | 15 min | Abort a walk-forward that runs longer |
+| `SEARCH_DEADLINE` | 50 min | Abandon a parameter search that runs longer (the previous result stays in use) |
+| `SEARCH_PAUSE` | 60 min | Wait after a search **finishes** before the next one starts |
+| `SEARCH_RETRY` | 5 min | Wait after a failed search |
 | `PAPER_FILE` | `paper_xs.json` | The persisted paper account |
 
 ### Paper state
@@ -43,11 +45,15 @@ The console chart: settings chosen by the live walk-forward on research window 2
 2. Reads the real account: wallet and committed margin. Purges every stored row of ineligible symbols (delisted, delisting, missing/invalid leverage, 1×-only). A held ineligible symbol fails the bar for explicit recovery: it is never fetched and never given an invented exit.
 3. Syncs traded and mark candles and funding for the universe plus any held (eligible) symbol.
 4. Builds the 14-day market. **A symbol with incomplete real data sits out this bar** (logged); a held symbol must be complete or the bar fails.
-5. Runs the live walk-forward from the free balance: paper equity (or the wallet) minus committed margin.
-6. Advances the paper account (above) with entries allowed only when the report `PASSED` or is `FORWARD TEST`, saves it, and logs each account change, open, add and close.
+5. Computes the screener scores and hands the market and the free balance (paper equity, or the wallet, minus committed margin) to `search_task`.
+6. Advances the paper account (above) with the settings from the latest search. Entries are allowed while those settings pass the safety rules; before the first search finishes, or when nothing passes them, no new positions open. Saves the account and logs each account change, open, add and close.
 7. Publishes the signal table and status.
 
 Any error ends the run and the supervisor restarts it.
+
+### `search_task`: the parameter search
+
+Runs the walk-forward over `live_grid()` (10,000 combinations, about 40,000 evaluations, about 20 s on 20 coins) on the newest market, then `walkforward::choose_live` against the settings in use, and stores the result for `bar_task`. The next search starts `SEARCH_PAUSE` (60 min) after this one **finishes**. A failed or timed-out search keeps the previous result and retries after `SEARCH_RETRY`. Its stall limit is `SEARCH_DEADLINE` + 10 min because the task cannot send heartbeats while the search runs.
 
 ### `console`
 

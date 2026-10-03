@@ -31,7 +31,7 @@ Score used to pick settings in-sample: `return % − 0.5 × max drawdown %`. It 
 
 ## `live_grid()`
 
-Long only, `Signal::CalmDip` unflipped (the direction comes from the full-universe signal study, `examples/signal_ic.rs`, not from P&L). The walk-forward picks among 32 combinations: hold 32 or 96 bars, 3 or 5 coins, 1× or 2×, no stop or a 10% stop, BTC trend filter off or on.
+Long only, `Signal::CalmDip` unflipped (the direction comes from the full-universe signal study, `examples/signal_ic.rs`, not from P&L). **10,000 combinations** (user request, 2026-10-03): hold 8/16/24/32/48/64/96/144/192/288 bars (2h–72h), 1–5 coins, 1×/2×/3×/5× leverage, stop none/5/10/15/20%, take-profit none/5/10/20/40%, BTC trend filter off/on. A test checks the count and that every combination is distinct.
 
 ## Grids
 
@@ -58,9 +58,15 @@ One round's bar ranges, chosen settings and in- and out-of-sample metrics. The r
 - `positive_windows` and `net_without_best`,
 - the verdict `passed` and the `reasons` it failed.
 
-### `forward_ok(&self) -> bool`
+## Champion/challenger (`Choice`, `pick`, `live_score`, `choose_live`)
 
-A weaker verdict than `passed`: no execution error, every round found settings, the out-of-sample result is profitable with enough trades and no liquidations, and the final settings are profitable, liquidation-free and within the drawdown cap over the 14 days. Only the profit-factor and best-window gates may be missed. The service then keeps paper trading, labelled **FORWARD TEST**.
+Paper always trades the best known **safe** settings (user design, 2026-10-03):
+
+- **`live_score(m, scores, equity, p)`:** `objective` on the latest `IS_BARS` if `p` trades at least `MIN_IS_TRADES` times there without liquidating, **and** it passes the two safety rules over all 14 days (no execution error, no liquidation, drawdown ≤ `MAX_DRAWDOWN_PCT`). `None` means not usable now.
+- **`pick(challenger, champion)`:** the challenger (the search's best) replaces the champion (the settings in use) only if it scores **strictly** higher; a tie, an unusable challenger or the same settings keep the champion. An unusable champion is replaced by a usable challenger. If neither is usable: `NoneSafe`.
+- **`choose_live`:** re-scores both on the current market and calls `pick`. Returns the settings and a `Choice` (`NewBest`, `KeptLastBest`, `NoneSafe`).
+
+The walk-forward verdict `passed` is information about the selection method; it no longer decides whether paper trades.
 
 ## `fn wf_best(grid, range, bt, deadline, evaluated)` (private)
 

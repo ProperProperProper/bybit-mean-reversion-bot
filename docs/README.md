@@ -9,7 +9,7 @@ There is one page per source file. Each page documents every function, type and 
 | [rules.md](rules.md) | `src/engine/rules.rs` | Per-coin Bybit rules: lot sizes, account fee, margin tiers, order-book cost |
 | [scores.md](scores.md) | `src/engine/scores.rs` | The screener: volatility, price action, volume, activity rank, trend score, Pulse |
 | [xs.md](xs.md) | `src/engine/xs.rs` | The strategy engine: ranking, orders, margin, liquidation, drawdown rules, daily P&L |
-| [walkforward.md](walkforward.md) | `src/engine/walkforward.rs` | The 14-day walk-forward gate and the strategy grids |
+| [walkforward.md](walkforward.md) | `src/engine/walkforward.rs` | The 14-day walk-forward, the champion/challenger choice and the strategy grids |
 | [metrics.md](metrics.md) | `src/engine/metrics.rs` | Trade records and performance metrics |
 | [research.md](research.md) | `src/engine/research.rs` | The three fixed 14-day research windows, research start equity |
 | [keychain.md](keychain.md) | `src/engine/keychain.rs` | Read-only API credentials from the macOS Keychain |
@@ -22,7 +22,7 @@ There is one page per source file. Each page documents every function, type and 
 
 ## Current verification
 
-Audit findings, their fixes and the remaining limitations are in [audit.md](audit.md). The live strategy is long-only CalmDip; its validation results and their limits are in [validation.md](validation.md). Paper trades only while the walk-forward gate allows.
+Audit findings, their fixes and the remaining limitations are in [audit.md](audit.md). The live strategy is long-only CalmDip; its validation results and their limits are in [validation.md](validation.md). Paper trades the best settings that pass the two safety rules (no liquidation, drawdown ≤ 25%); the walk-forward check is information.
 
 ## How it fits together
 

@@ -66,7 +66,7 @@ The share of values ≤ `x` in an already-sorted list, scaled to 0–100 (50 whe
 
 Scores as `[symbol][bar]`. At every bar:
 
-1. Collect symbols with raw features at that bar, and keep the **top `universe` by 24h turnover** (100 live). The universe is re-chosen every bar from data up to that bar.
+1. Collect symbols with raw features at that bar, and keep the **top `universe` by 24h turnover** (`walkforward::UNIVERSE`, 20 live). The universe is re-chosen every bar from data up to that bar.
 2. Compute the percentiles, rank value, price-action percentile and trend score within that universe.
 3. Sort by rank value to assign `rank`.
 

@@ -4,13 +4,16 @@
 //! 1344 bars = 3 windows of 8 days in-sample (768) + 2 days out-of-sample
 //! (192), stepping 2 days. Params are chosen on each in-sample window only
 //! (and must survive all earlier data: no liquidation, drawdown <= 25%), then
-//! judged on the next unseen 2 days. The params used for paper trading are
-//! chosen the same way on the most recent 8 days.
+//! judged on the next unseen 2 days. The best params on the most recent 8 days
+//! challenge the params paper is using; `choose_live` keeps whichever scores
+//! higher on that data among those passing the two safety rules (no
+//! liquidation, drawdown <= 25% over the 14 days).
 //!
-//! Gates: zero liquidations anywhere, out-of-sample profit factor > 1.2 and
-//! net > 0, the net still > 0 without the single best window, at least
-//! MIN_OOS_TRADES trades, final params profitable and liquidation-free over the
-//! 14 days with drawdown <= 25%.
+//! The walk-forward check (`passed`): zero liquidations anywhere, out-of-sample
+//! profit factor > 1.2 and net > 0, the net still > 0 without the single best
+//! window, at least MIN_OOS_TRADES trades, final params profitable and
+//! liquidation-free over the 14 days with drawdown <= 25%. It is reported as
+//! information about the selection method; it does not gate paper trading.
 
 use super::governor;
 use super::metrics::Metrics;
@@ -32,8 +35,9 @@ pub const CANDIDATES: usize = UNIVERSE;
 pub const MIN_IS_TRADES: usize = 8;
 pub const MIN_OOS_TRADES: usize = 8;
 pub const MAX_DRAWDOWN_PCT: f64 = 25.0;
-// NOTE(agents): These gates are the bot's safety rail. Changing a threshold to make a strategy pass
-//               defeats the purpose; report the failure instead.
+// NOTE(agents): These thresholds define the walk-forward CHECK, reported as information since
+//               2026-10-03. The rules that stop trading are the two safety rules in `live_score`
+//               (no liquidation, drawdown <= MAX_DRAWDOWN_PCT). Don't relax those to get trades.
 pub const MIN_PROFIT_FACTOR: f64 = 1.2;
 
 fn objective(m: &Metrics) -> f64 {
@@ -47,10 +51,49 @@ mod tests {
     #[test]
     fn live_grid_is_long_only_calm_dip() {
         let g = live_grid();
-        assert_eq!(g.len(), 32);
+        assert_eq!(g.len(), 10_000);
+        let mut keys: Vec<String> = g.iter().map(|p| format!("{p:?}")).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 10_000, "every combination is distinct");
         assert!(g
             .iter()
             .all(|p| p.long_only && !p.flip && p.signal == Signal::CalmDip));
+    }
+
+    #[test]
+    fn champion_is_kept_unless_the_new_best_scores_higher() {
+        // Challenger better: switch.
+        assert_eq!(
+            pick(Some(("new", 2.0)), Some(("old", 1.0))),
+            (Some("new"), Choice::NewBest)
+        );
+        // Challenger not better (lower or equal): keep the settings in use.
+        assert_eq!(
+            pick(Some(("new", 1.0)), Some(("old", 2.0))),
+            (Some("old"), Choice::KeptLastBest)
+        );
+        assert_eq!(
+            pick(Some(("new", 2.0)), Some(("old", 2.0))),
+            (Some("old"), Choice::KeptLastBest)
+        );
+        // The search found nothing usable: keep the champion.
+        assert_eq!(
+            pick(None, Some(("old", -5.0))),
+            (Some("old"), Choice::KeptLastBest)
+        );
+        // The champion fails the safety rules now: the challenger takes over.
+        assert_eq!(
+            pick(Some(("new", -1.0)), None),
+            (Some("new"), Choice::NewBest)
+        );
+        // Same settings found again: kept, not "new".
+        assert_eq!(
+            pick(Some(("same", 3.0)), Some(("same", 3.0))),
+            (Some("same"), Choice::KeptLastBest)
+        );
+        // Nothing passes the safety rules: no settings, paper opens nothing.
+        assert_eq!(pick::<&str>(None, None), (None, Choice::NoneSafe));
     }
 
     #[test]
@@ -120,10 +163,6 @@ mod tests {
             "{:?}",
             r.reasons
         );
-        assert!(
-            r.forward_ok(),
-            "still positive overall: paper may forward-test, labelled as such"
-        );
     }
 }
 
@@ -131,19 +170,46 @@ mod tests {
 
 use super::xs::{self, Regime, Signal, XsParams};
 
-// NOTE(agents): Keep the live grid small and its direction fixed by evidence (signal_ic), not by
-//               P&L. Widening it to hundreds of combinations selected noise in testing (every 'ALL'
-//               walk-forward failed).
+// NOTE(agents): The user chose 10,000 combinations (2026-10-03). Keep the SIGNAL and its direction
+//               fixed by evidence (signal_ic), not P&L. A wide search finds lucky settings more
+//               easily; the champion rule (replace only on a strictly higher score) and the two
+//               safety rules in `live_score` are what keep it in check. Don't remove them.
 /// The paper strategy: long only, buying calm dips (`Signal::CalmDip`
 /// unflipped: the direction comes from the full-universe signal study in
-/// examples/signal_ic.rs, not from P&L). The walk-forward picks the hold,
-/// basket size, leverage, stop and BTC filter. Not a profitability claim
-/// (see docs/validation.md).
+/// examples/signal_ic.rs, not from P&L). 10,000 combinations (user request,
+/// 2026-10-03): hold 2h-72h (10), 1-5 coins (5), 1/2/3/5x (4), stop none or
+/// 5-20% (5), take-profit none or 5-40% (5), BTC filter off/on (2). Not a
+/// profitability claim (see docs/validation.md).
 pub fn live_grid() -> Vec<XsParams> {
-    long_family_grid(Signal::CalmDip)
-        .into_iter()
-        .filter(|p| !p.flip && p.hold >= 32)
-        .collect()
+    let mut out = Vec::with_capacity(10_000);
+    for hold in [8usize, 16, 24, 32, 48, 64, 96, 144, 192, 288] {
+        for top in 1..=5usize {
+            for gross_leverage in [1.0, 2.0, 3.0, 5.0] {
+                for stop_pct in [None, Some(5.0), Some(10.0), Some(15.0), Some(20.0)] {
+                    for take_profit_pct in [None, Some(5.0), Some(10.0), Some(20.0), Some(40.0)] {
+                        for regime in [Regime::Off, Regime::BtcTrend] {
+                            out.push(XsParams {
+                                signal: Signal::CalmDip,
+                                flip: false,
+                                lookback: 0,
+                                hold,
+                                top,
+                                gross_leverage,
+                                stop_pct,
+                                risk: xs::Risk {
+                                    take_profit_pct,
+                                    ..Default::default()
+                                },
+                                long_only: true,
+                                regime,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Every ranking signal (screener scores, return, funding).
@@ -279,27 +345,6 @@ pub struct WfReport<P> {
 }
 
 pub type XsReport = WfReport<XsParams>;
-
-impl<P> WfReport<P> {
-    // NOTE(agents): Only the profit-factor and best-window gates may be missed here; never drop the
-    //               liquidation, drawdown or final-profit conditions.
-    /// Weaker than `passed`: out-of-sample profitable with no liquidations, every
-    /// window found params, final params survive the 14 days, but the profit
-    /// factor gate may be missed. Paper keeps forward-testing in this state.
-    pub fn forward_ok(&self) -> bool {
-        self.oos.execution_error.is_none()
-            && self.windows.iter().all(|w| w.params.is_some())
-            && self.oos.trades >= MIN_OOS_TRADES
-            && self.oos.liquidations == 0
-            && self.oos.net() > 0.0
-            && self.full_period.as_ref().is_some_and(|f| {
-                f.execution_error.is_none()
-                    && f.net() > 0.0
-                    && f.liquidations == 0
-                    && f.max_drawdown_pct <= MAX_DRAWDOWN_PCT
-            })
-    }
-}
 
 /// Best params on `range` by objective, among those that trade enough, never
 /// liquidate, and survive all data up to range.end (no liquidation, DD cap).
@@ -456,6 +501,77 @@ pub fn run_wf<P: Clone>(
         passed: reasons.is_empty(),
         reasons,
     })
+}
+
+/// How this bar's paper settings were chosen (champion/challenger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Choice {
+    /// The search found settings that beat the ones in use (or none were in use).
+    NewBest,
+    /// Nothing scored higher: the settings already in use are kept.
+    KeptLastBest,
+    /// Neither the new best nor the settings in use pass the safety rules.
+    NoneSafe,
+}
+
+// NOTE(agents): User design (2026-10-03): paper always trades the best known settings. The
+//               search's best (challenger) replaces the settings in use (champion) only if it
+//               scores strictly higher on the SAME latest data; otherwise the champion stays.
+//               The safety rules are not optional: settings that liquidate or exceed the
+//               drawdown cap over the 14 days are never used, champion included. The
+//               walk-forward verdict is reported as information, not a trade gate.
+/// Pick between the challenger and the champion by score; `None` scores are
+/// unusable. A tie keeps the champion (no churn for equal evidence).
+pub fn pick<P: Clone + PartialEq>(
+    challenger: Option<(P, f64)>,
+    champion: Option<(P, f64)>,
+) -> (Option<P>, Choice) {
+    match (challenger, champion) {
+        (Some((c, cs)), Some((k, ks))) if c != k && cs > ks => (Some(c), Choice::NewBest),
+        (_, Some((k, _))) => (Some(k), Choice::KeptLastBest),
+        (Some((c, _)), None) => (Some(c), Choice::NewBest),
+        (None, None) => (None, Choice::NoneSafe),
+    }
+}
+
+/// Score of `p` for live use, with the same rules the search applies: its
+/// objective on the latest `IS_BARS` if it trades at least `MIN_IS_TRADES`
+/// times there without liquidating, and survives all 14 days (no execution
+/// error, no liquidation, drawdown within the cap). `None` = not usable now.
+pub fn live_score(
+    m: &Market,
+    scores: &[Vec<Option<Score>>],
+    equity: f64,
+    p: &XsParams,
+) -> Option<f64> {
+    let recent = xs::backtest(m, scores, BARS - IS_BARS..BARS, p, equity).metrics();
+    if recent.execution_error.is_some() || recent.liquidations > 0 || recent.trades < MIN_IS_TRADES
+    {
+        return None;
+    }
+    let all = xs::backtest(m, scores, 0..BARS, p, equity).metrics();
+    if all.execution_error.is_some()
+        || all.liquidations > 0
+        || all.max_drawdown_pct > MAX_DRAWDOWN_PCT
+    {
+        return None;
+    }
+    Some(objective(&recent))
+}
+
+/// The settings paper trades this bar: the search's best (`challenger`) or
+/// the settings in use (`champion`), each re-scored on the current market.
+pub fn choose_live(
+    m: &Market,
+    scores: &[Vec<Option<Score>>],
+    equity: f64,
+    challenger: Option<&XsParams>,
+    champion: Option<&XsParams>,
+) -> (Option<XsParams>, Choice) {
+    let score = |p: Option<&XsParams>| {
+        p.and_then(|p| live_score(m, scores, equity, p).map(|s| (p.clone(), s)))
+    };
+    pick(score(challenger), score(champion))
 }
 
 pub fn run_xs_with(

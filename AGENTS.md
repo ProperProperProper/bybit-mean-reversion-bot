@@ -36,6 +36,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - **Real data and real code paths only.** Never fill a missing candle, fee, tier or balance with an invented or default value. A missing input means "don't trade" or an explicit error.
 - **Top 20 only**, by 24h turnover among eligible Bybit token USDT perpetuals. Measure only those 20; incomplete rules reduce the universe rather than scanning extra candidates. Historical top-50 results below describe the former configuration, not validation of the new top-20 setup.
 - **Delisted tokens are hard-excluded** (user request): never fetched or entered, excluded held symbols stop paper with an explicit recovery error rather than fetch excluded contracts or fabricate exits, and `Cache::retain_symbols` deletes their stored rows every bar and in every research/holdout DB. Do not reintroduce delisted symbols anywhere, research included.
+- **Parameter search (user design, 2026-10-03):** 10,000 combinations; the next search starts 60 minutes after the previous one FINISHES (`search_task`), never per candle. Champion/challenger: paper keeps the settings in use unless the search's best scores strictly higher; the two safety rules (no liquidation, drawdown <= 25% over 14 days) always apply. The walk-forward check is information only.
 - **5 USDT floor:** no entries or adds while the free balance (wallet minus margin committed anywhere on the account) is below 5 USDT.
 - No dead code. Strict clippy clean. The user works unattended: don't stop to ask, redeploy when needed, commit and push when done.
 - Report results honestly, including losses. Don't tune on the test windows until a number looks good.
@@ -51,7 +52,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 ## Current state (2026-10-02)
 
 - All findings in `docs/audit.md` are fixed with regression tests (mark-price funding/liquidation, isolated margin, neutral fills, lot rounding, risk-tier deductions, new listings, balance floor, and more).
-- Live grid: `walkforward::live_grid()` = long-only `Signal::CalmDip` (unflipped), hold 8h or 24h, 3 or 5 coins, 1× or 2×, stop none or 10%, BTC trend filter off or on (32 combos).
+- Live grid: `walkforward::live_grid()` = long-only `Signal::CalmDip` (unflipped), 10,000 combinations (hold 2h–72h, 1–5 coins, 1/2/3/5×, stop none or 5–20%, take-profit none or 5–40%, BTC filter off/on), searched hourly by `search_task` with champion/challenger.
 - The walk-forward of the full strategy (relative edge + market exposure + costs) passes in 1 of 4 data sets; forward tests −9.8% and +21.9%. The signal has positive relative evidence on the tested sample; whether the long-only *account* makes money also depends on the market. See `docs/validation.md`.
 
 ## Evidence and traps

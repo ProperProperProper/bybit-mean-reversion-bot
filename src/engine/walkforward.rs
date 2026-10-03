@@ -23,12 +23,12 @@ use std::time::Instant;
 pub const IS_BARS: usize = 768;
 pub const OOS_BARS: usize = 192;
 pub const WINDOW_STARTS: [usize; 3] = [0, 192, 384];
-/// The top 50 Bybit token USDT perpetuals by 24h turnover that have complete
+/// The top 20 Bybit token USDT perpetuals by 24h turnover that have complete
 /// Bybit rules (lot filter, account fee, margin tiers, measured order book).
-pub const UNIVERSE: usize = 50;
-/// Coins measured for rules each refresh, so a coin without complete rules can
-/// drop out of the universe and the next one by turnover takes its place.
-pub const CANDIDATES: usize = 75;
+pub const UNIVERSE: usize = 20;
+/// Measure only the selected top 20. Missing rules reduce the count; do not
+/// scan additional candidates beyond the user's cap.
+pub const CANDIDATES: usize = UNIVERSE;
 pub const MIN_IS_TRADES: usize = 8;
 pub const MIN_OOS_TRADES: usize = 8;
 pub const MAX_DRAWDOWN_PCT: f64 = 25.0;

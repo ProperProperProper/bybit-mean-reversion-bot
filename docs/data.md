@@ -27,7 +27,7 @@ An HTTP client (5 s connect timeout, 15 s total) with a shared pacing lock.
 | `get` (private) | Paced public GET. Up to 5 attempts: rate limits and Bybit's transient service error (HTTP 429, `retCode` 10006/10016/10018) back off 2, 4, 8… s; network errors 0.5, 1, 2… s; any other non-zero `retCode` fails at once. |
 | `signed_get` (private) | Bybit v5 HMAC-SHA256 signed GET, **re-signed and retried** the same way. Only ever used for reads. |
 | `usdt_perpetual_lots` | USDT linear perpetuals that are `Trading`, not scheduled for delisting, not pre-listing, have a finite `leverageFilter.maxLeverage > 1`, and are tokens (no stock, ETF, forex or commodity contracts; `is_token_perpetual`), each with its lot filter and `launchTime`. This is the only source of tradeable symbols: **delisted and delisting tokens are hard-excluded**. |
-| `top_margin_tokens(instruments, count)` | The `count` (75 candidates) with the highest 24h turnover among those with a lot filter, best first. An instrument without a ticker or a valid turnover is left out of that bar. |
+| `top_margin_tokens(instruments, count)` | The `count` (20 candidates) with the highest 24h turnover among those with a lot filter, best first. An instrument without a ticker or a valid turnover is left out of that bar. |
 | `risk_limits` | Every symbol's maintenance-margin tiers, deductions derived as above. |
 | `orderbook(symbol)` | 500 levels per side, best first, and the book timestamp. |
 | `taker_fees(creds)` | This account's taker fee per linear symbol (signed). |
@@ -38,7 +38,7 @@ An HTTP client (5 s connect timeout, 15 s total) with a shared pacing lock.
 
 ## `universe(candidates, measured, n)`
 
-The first `n` (50) candidates, in turnover order, that have stored rules. A coin without margin tiers, fee, lot filter or a measurable book never enters the universe.
+The first `n` (20) candidates, in turnover order, that have stored rules. A coin without margin tiers, fee, lot filter or a measurable book never enters the universe.
 
 ## `struct Cache`
 
@@ -46,7 +46,7 @@ SQLite (WAL) with tables `bars`, `marks`, `funding`, `rules` (JSON), `instrument
 
 | Function | What it does |
 |---|---|
-| `put_instruments` / `put_universe` | Launch times; the current top-50 universe. |
+| `put_instruments` / `put_universe` | Launch times; the current top-20 universe. |
 | `listing_start` (private) | The first possible candle: launch rounded up to a bar, or later when Bybit's history begins later (`first_trades`). |
 | `bars_since` / `marks_since` | The first missing candle from `max(earliest, listing start)`: internal gaps and the tail are retried. |
 | `note_first_trade(symbol, since, earliest, fetched)` | When a fetch from the listing boundary of a symbol listed **inside** the window returns its first candle later, records that candle as where trading began. |

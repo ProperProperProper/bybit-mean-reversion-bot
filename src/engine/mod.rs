@@ -65,7 +65,7 @@ pub struct Market {
     pub symbols: Vec<String>,
     /// Exchange launch timestamps, ms. None means unverified listing history.
     pub listing_times: Vec<Option<i64>>,
-    /// Held symbols outside the current top 50 remain managed but cannot re-enter.
+    /// Held symbols outside the current top 20 remain managed but cannot re-enter.
     pub entry_eligible: Vec<bool>,
     pub bars: Vec<Vec<Option<Bar>>>,
     // NOTE(agents): Funding and liquidation must use these MARK candles; traded candles are for

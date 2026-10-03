@@ -1,6 +1,6 @@
 # `src/engine/research.rs`: research windows and start equity
 
-Status (2 October 2026): the windows hold real traded and mark candles, funding, listing starts and current rules for the top 50. They also selected the strategy family, so they are not an untouched holdout.
+Status (3 October 2026): configured for the top 20 only. Research windows must be deleted and refetched for this configuration; earlier top-50 results do not validate it.
 
 The three fixed, back-to-back 14-day windows of real Bybit data used for strategy selection. `examples/fetch_research_data.rs` stores them in the runtime folder.
 

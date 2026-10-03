@@ -1,4 +1,4 @@
-//! Cross-sectional, market-neutral portfolio over the top-50 USDT perpetuals.
+//! Cross-sectional, market-neutral portfolio over the top-20 USDT perpetuals.
 //! Every `hold` bars (aligned to timestamps, so backtest and live rebalance at
 //! the same closes) rank the universe by a causal `Signal` (screener scores,
 //! return or settled funding), then hold LONG the `top` lowest and SHORT the

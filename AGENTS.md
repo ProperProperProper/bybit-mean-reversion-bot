@@ -34,7 +34,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - **Long only.** The live strategy is long-only. Do not bring back shorts or the market-neutral mode as the live strategy unless the user asks.
 - **Improve entry signals**, judged on real data and on data the signal never saw.
 - **Real data and real code paths only.** Never fill a missing candle, fee, tier or balance with an invented or default value. A missing input means "don't trade" or an explicit error.
-- **Top 50 Bybit token USDT perpetuals by 24h turnover that have complete Bybit rules** (margin tiers, account fee, lot filter, measured book). The top 75 are measured; coins without data are dropped.
+- **Top 20 only**, by 24h turnover among eligible Bybit token USDT perpetuals. Measure only those 20; incomplete rules reduce the universe rather than scanning extra candidates. Historical top-50 results below describe the former configuration, not validation of the new top-20 setup.
 - **Delisted tokens are hard-excluded** (user request): never fetched or entered, excluded held symbols stop paper with an explicit recovery error rather than fetch excluded contracts or fabricate exits, and `Cache::retain_symbols` deletes their stored rows every bar and in every research/holdout DB. Do not reintroduce delisted symbols anywhere, research included.
 - **5 USDT floor:** no entries or adds while the free balance (wallet minus margin committed anywhere on the account) is below 5 USDT.
 - No dead code. Strict clippy clean. The user works unattended: don't stop to ask, redeploy when needed, commit and push when done.
@@ -80,7 +80,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - Volatility-scaled orders delayed by missing candles recompute weights at execution; the live grid leaves volatility scaling disabled. Do not enable it before storing decision-time weights.
 
 - Strict instrument eligibility also requires a finite Bybit `leverageFilter.maxLeverage > 1`. Missing, malformed and 1x-only contracts are rejected before ranking, rule requests, scoring or fetching candles, in live and research discovery.
-- Held symbols outside the top 50 remain managed only while still instrument-eligible. Excluded held symbols are purged and require explicit recovery; no excluded-symbol candle requests are made.
+- Held symbols outside the top 20 remain managed only while still instrument-eligible. Excluded held symbols are purged and require explicit recovery; no excluded-symbol candle requests are made.
 
 ## Strict test-representation rule — user instruction
 

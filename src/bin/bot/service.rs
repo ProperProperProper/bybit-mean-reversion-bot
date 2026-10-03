@@ -2,7 +2,7 @@
 //! walkforward::live_grid) — never places orders.
 //!
 //! bar_task (each 15m close): sync closed bars + funding for the universe
-//! (top 50 USDT perpetuals by 24h turnover with complete rules) -> scores ->
+//! (top 20 USDT perpetuals by 24h turnover with complete rules) -> scores ->
 //! 14-day walk-forward -> step the persisted paper portfolio through every new
 //! bar with the chosen params (missed bars replayed in order) -> publish the
 //! current LONG targets (calmest coins that fell most over 24h).
@@ -456,7 +456,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         let t0 = Instant::now();
         // Candidates by turnover (trading, no delisting scheduled) and, hourly,
         // their full Bybit rules: order rules, the account's fees, margin tiers,
-        // measured books. The universe is the top 50 with complete rules.
+        // measured books. The universe is the top 20 with complete rules.
         let lots = app.client.usdt_perpetual_lots().await?;
         // NOTE(agents): The only list of tradeable tokens: trading, no delisting scheduled, maximum
         //               leverage above 1x. Everything else is hard-excluded before ranking,
@@ -488,7 +488,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // mirrored; margin committed elsewhere on the account is reserved).
         let account = app.client.usdt_account(&app.creds).await?;
         let balance = account.wallet;
-        // NOTE(agents): Universe = top 50 by 24h turnover among the top 75 that have complete Bybit
+        // NOTE(agents): Universe = top 20 by 24h turnover among the top 20 that have complete Bybit
         //               rules (user requirement: drop coins without margin data).
         let lots = data::universe(
             &candidates,
@@ -516,7 +516,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                 format!("purged stored data of {purged} ineligible symbol(s)"),
             );
         }
-        // Keep managing eligible held symbols even if turnover leaves the top 50.
+        // Keep managing eligible held symbols even if turnover leaves the top 20.
         if let Some(ps) = app.paper.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             for pos in &ps.portfolio.positions {
                 anyhow::ensure!(trading.contains(&pos.symbol),

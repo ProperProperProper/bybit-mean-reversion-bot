@@ -9,8 +9,8 @@ The original three tools are read-only towards Bybit. They need the Keychain cre
 Builds the research data:
 
 1. Prints the real account balance.
-2. Lists today's top 75 token USDT perpetuals by 24h turnover (never delisted ones).
-3. Measures their Bybit rules now (fails rather than storing an incomplete snapshot) and keeps the top 50 with complete rules as the universe, storing their launch times.
+2. Lists today's top 20 token USDT perpetuals by 24h turnover (never delisted ones).
+3. Measures their Bybit rules now (fails rather than storing an incomplete snapshot) and keeps those with complete rules, up to 20, as the universe, storing their launch times.
 4. For each of the three 14-day windows ([research.md](research.md)), fetches any missing traded and mark candles and the settled funding into `window_k.db` (6 coins at a time, paced), recording a new listing's first trade.
 
 Any symbol still missing a candle after its listing start fails the run.
@@ -31,7 +31,7 @@ Long-only families by default (`NEUTRAL=1` for the market-neutral ones), plus bu
 
 ## `signal_ic.rs`: entry-signal study
 
-`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory of windows holding candles for every trading token (e.g. `holdout/` created by `HOLDOUT=` mode); the universe is then the top 50 by turnover at each bar rather than today's top 50. `WINDOWS=` picks windows, `SIGNAL=` one signal. Missing future endpoints exclude an entire frozen decision-time sample, and the output reports the exclusion count. Results remain conditional on coverage and stored-symbol selection. The t-statistic assumes independent observations. No network.
+`cargo run --release --example signal_ic [-- WINDOW_DIR]`. For every signal and holding period (4h, 8h, 24h, non-overlapping), it reports the mean rank correlation (IC) between the signal and each coin's next-open-to-close return relative to the average coin, its t-stat, and the excess return of the 5 lowest and 5 highest values. Pass a directory of windows holding candles for every trading token (e.g. `holdout/` created by `HOLDOUT=` mode); the universe is then the top 20 by turnover at each bar rather than today's top 20. `WINDOWS=` picks windows, `SIGNAL=` one signal. Missing future endpoints exclude an entire frozen decision-time sample, and the output reports the exclusion count. Results remain conditional on coverage and stored-symbol selection. The t-statistic assumes independent observations. No network.
 
 ## `risk_variants.rs`: `main()`
 

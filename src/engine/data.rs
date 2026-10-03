@@ -152,9 +152,9 @@ impl Client {
         Ok(out)
     }
 
-    // NOTE(agents): Ranks CANDIDATES (75); the traded universe is `universe()` = the top 50 of
-    //               those with complete rules. Don't rank straight to 50: coins without
-    //               margin/rules data must drop out and the next coin take their place.
+    // NOTE(agents): User requests ONLY the top 20 eligible pairs. CANDIDATES
+    // equals UNIVERSE; do not widen measurement to extra pairs. Missing rules
+    // can reduce the tradeable count below 20.
     /// Current top margin-eligible token perpetuals by public 24h turnover.
     pub async fn top_margin_tokens(
         &self,

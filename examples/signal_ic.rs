@@ -11,7 +11,7 @@
 //!
 //! Usage: `signal_ic [WINDOW_DIR]`. With a directory (window_k.db holding
 //! candles for every eligible token, e.g. `fetch_research_data` HOLDOUT
-//! output), the universe is the top 50 by turnover at each
+//! output), the universe is the top 20 by turnover at each
 //! bar among the stored symbols. Excluding delisted symbols still introduces
 //! survivorship bias. Holding periods
 //! do not overlap (one sample every h bars).
@@ -178,9 +178,9 @@ fn main() -> anyhow::Result<()> {
     println!(
         "universe: {}",
         if historical.is_some() {
-            "top 50 by turnover at each bar among stored symbols (delisted exclusions cause survivorship bias)"
+            "top 20 by turnover at each bar among stored symbols (delisted exclusions cause survivorship bias)"
         } else {
-            "top 50 among today's tradeable coins (biased towards recent winners)"
+            "top 20 among today's tradeable coins (biased towards recent winners)"
         }
     );
     println!("Incomplete decision-time universes are excluded in full; remaining results are conditional on coverage. t-stat assumes independent samples.");

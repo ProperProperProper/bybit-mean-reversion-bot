@@ -36,6 +36,10 @@ An HTTP client (5 s connect timeout, 15 s total) with a shared pacing lock.
 | `klines_since` / `klines_range` / `mark_range` | Closed 15m traded or mark-price candles, oldest first, paged backwards 1,000 at a time. The forming bar is never included; an invalid OHLC row fails the call. |
 | `funding_since` / `funding_range` | Settled funding, paged by 200; a malformed record fails the call. |
 
+## `with_held(candidates, eligible, held)`
+
+The symbols to measure rules for: the turnover candidates plus every held symbol that is still eligible. A coin that drops out of the top 20 while held keeps fresh rules (the rules table is a replaced snapshot).
+
 ## `universe(candidates, measured, n)`
 
 The first `n` (20) candidates, in turnover order, that have stored rules. A coin without margin tiers, fee, lot filter or a measurable book never enters the universe.

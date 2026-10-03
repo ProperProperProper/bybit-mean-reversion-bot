@@ -9,6 +9,16 @@ A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned re
 | `MIN_ENTRY_BALANCE` | 5 USDT | No rebalance entry and no add while the free balance is below this. Exits continue. |
 | `NEUTRAL_TOLERANCE` | 2% | Long and short gross notional may differ by at most this fraction, or the rebalance is not placed |
 | `SLOT_HEADROOM` (private) | 0.99 | Share of the free balance a rebalance commits; the rest covers closing the outgoing positions |
+| `DRAWDOWN_STOP_PCT` | 25% | Account drawdown stop: close everything, `stopped_out`, no new positions or adds until the next fresh reset |
+| `ENTRY_WICK_GUARD_PCT` | 0.5% | Entries and adds fill only when the traded open is within this of the mark open; otherwise they wait for the next open |
+
+## Timing and lifecycle
+
+- **Decision latency (`decision_fill_bound`):** a decision taken at bar t's close (rebalance, close-based exit, add, breaker or drawdown flatten) fills no earlier than bar t+2's open, because live bar t is processed after its close. Each decision is stamped once when made; re-reaching the same decision keeps its bound. Live, `defer_new_decisions(now)` raises every pending bound to the next open after `now`.
+- **Resting orders are immediate:** intrabar stops (mark-triggered), liquidation and live WebSocket exits.
+- **Volatility weights** are fixed at the decision close (`pending_weights`, by symbol name) and reused by a delayed fill.
+- **Held positions** use fresh rules when present, else the rules measured at entry (`entry_rules`), for exits, funding and liquidation; new orders need fresh rules.
+- **Live exits** (`live_exit`) are locked in by `live_check` and booked when their bar is stepped, after that bar's opening funding.
 
 ## `enum Signal`
 
@@ -96,8 +106,8 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 
 1. Every held position needs a mark candle at `t`, else `execution_error`.
 2. Funding stamped at this open is charged; then any position whose mark open is through its liquidation level is liquidated, **before** any queued action.
-3. Queued actions: breaker flatten, then per-position stop / take-profit / rebalance exit; an add only when no rebalance coincides and entries are allowed.
-4. Rebalance (if decided earlier and due): waits a bar if any target lacks data; otherwise closes every position, then opens all legs with the fixed slot budget on a copy. The copy replaces the account only if **every** leg filled and (unless long only) the sides are within `NEUTRAL_TOLERANCE`; otherwise `rejected_rebalances` += 1. No entries while the free balance is below the minimum.
+3. Live exits that fall inside this bar are booked at their recorded mark and time. Queued actions whose bound has arrived: breaker flatten, then per-position stop / take-profit / rebalance exit; an add only when no rebalance coincides and entries are allowed.
+4. Rebalance (if decided earlier and its bound has arrived): waits a bar if any target lacks data or its traded open is a wick (more than `ENTRY_WICK_GUARD_PCT` from the mark open), keeping the decided targets, budget and weights; otherwise closes every position, then opens all legs with the fixed slot budget on a copy. The copy replaces the account only if **every** leg filled and (unless long only) the sides are within `NEUTRAL_TOLERANCE`; otherwise `rejected_rebalances` += 1. No entries while the free balance is below the minimum.
 5. Inside the bar: intrabar funding is refused (it needs finer mark data); mark-price liquidation (open or adverse extreme) first, then the stop, also triggered by the mark (wick-safe), filled at the stop level or the traded open on a gap; then the close-based rules (on the mark close) queue the next action.
 6. Funding stamped at this bar's close is charged at the next bar's mark open. On the newest loaded bar it waits for that bar.
 7. Breaker check, then the **drawdown stop** (marked equity `DRAWDOWN_STOP_PCT` = 25% below its peak: close everything at the next open, `stopped_out`, no new positions or adds for the rest of the run), then `decide_close`, then peak and drawdown.

@@ -646,6 +646,25 @@ mod eligibility_tests {
     }
 }
 
+// NOTE(agents): Rules are a replaced snapshot. Measure held symbols too, or a coin that drops
+//               out of the top-20 candidates by turnover loses its rules at the next hourly
+//               refresh and its open position can no longer be closed or funded.
+/// The symbols to measure rules for: the turnover candidates plus every held
+/// symbol that is still an eligible instrument (taken from `eligible`).
+pub fn with_held(
+    candidates: &[(String, Option<LotFilter>, i64)],
+    eligible: &[(String, Option<LotFilter>, i64)],
+    held: &[String],
+) -> Vec<(String, Option<LotFilter>, i64)> {
+    let mut out = candidates.to_vec();
+    for item in eligible {
+        if held.contains(&item.0) && !out.iter().any(|c| c.0 == item.0) {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
 /// The first `n` of `candidates` (ranked by turnover) that have complete Bybit
 /// rules: coins without margin tiers, fee, lot filter or a measurable book are
 /// left out and the next coin by turnover takes the place.
@@ -1216,6 +1235,24 @@ mod gap_tests {
                 && m.listing_times[0].is_none()
         );
         assert_eq!(cache.retain_symbols(&keep).unwrap(), 0);
+    }
+
+    #[test]
+    fn held_symbols_outside_the_candidates_are_still_measured() {
+        let lot = |s: &str| (s.to_string(), None, 1);
+        let candidates = vec![lot("BTCUSDT"), lot("ETHUSDT")];
+        let eligible = vec![
+            lot("BTCUSDT"),
+            lot("ETHUSDT"),
+            lot("DOTUSDT"),
+            lot("XRPUSDT"),
+        ];
+        let held = vec!["DOTUSDT".to_string(), "BTCUSDT".to_string()];
+        let names: Vec<String> = with_held(&candidates, &eligible, &held)
+            .into_iter()
+            .map(|x| x.0)
+            .collect();
+        assert_eq!(names, ["BTCUSDT", "ETHUSDT", "DOTUSDT"]);
     }
 
     #[test]

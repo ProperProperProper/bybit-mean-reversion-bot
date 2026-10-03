@@ -1,6 +1,6 @@
 # Validation — 2 October 2026
 
-All figures below are records of past experiments. The databases they were computed from were deleted in the 2026-10-02 fresh-data reset (user rule: every change restarts the bot on freshly fetched data); rerun the tools to reproduce on new data. The CalmDip holdout is spent and must not be reused for tuning.
+All figures below are records of past experiments, computed before the 2026-10-03 timing fixes (they assumed decisions fill at the very next open; the engine now fills them two bars after the deciding close, as live). The databases they were computed from were deleted in the 2026-10-02 fresh-data reset (user rule: every change restarts the bot on freshly fetched data); rerun the tools to reproduce on new data. The CalmDip holdout is spent and must not be reused for tuning.
 
 ## Long-only strategy (current live)
 
@@ -73,7 +73,7 @@ All numbers come from real Bybit data: closed 15-minute traded and mark-price ca
 ## Tests
 
 ```sh
-cargo test --release --all-targets   # 70 tests, all pass (2026-10-03)
+cargo test --release --all-targets   # 74 tests, all pass (2026-10-03)
 cargo clippy --all-targets -- -D warnings   # clean
 ```
 

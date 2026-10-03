@@ -41,7 +41,7 @@ The console chart: settings chosen by the live full-window search on research wi
 
 ### `bar_task`: once per closed 15-minute bar
 
-1. Lists the top 20 token USDT perpetuals by 24h turnover and stores their launch times; hourly, re-measures their rules. The universe is the top 20 of them with complete rules (a warning is logged if fewer qualify).
+1. Lists the top 20 token USDT perpetuals by 24h turnover and stores their launch times; hourly, re-measures rules for them plus every held coin (`data::with_held`). The universe is the top 20 of them with complete rules (a warning is logged if fewer qualify).
 2. Reads the real account: wallet and committed margin. Purges every stored row of ineligible symbols (delisted, delisting, missing/invalid leverage, 1×-only). A held ineligible symbol fails the bar for explicit recovery: it is never fetched and never given an invented exit.
 3. Syncs traded and mark candles and funding for the universe plus any held (eligible) symbol.
 4. Builds the 14-day market. **A symbol with incomplete real data sits out this bar** (logged); a held symbol must be complete or the bar fails.

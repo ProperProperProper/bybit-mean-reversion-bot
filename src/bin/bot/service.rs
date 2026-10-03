@@ -504,14 +504,30 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             .client
             .top_margin_tokens(&lots, walkforward::CANDIDATES)
             .await?;
-        app.cache.put_instruments(&candidates)?;
+        let held: Vec<String> = app
+            .paper
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|ps| {
+                ps.portfolio
+                    .positions
+                    .iter()
+                    .map(|p| p.symbol.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Candidates plus held symbols: a held coin keeps fresh rules after turnover
+        // moves it out of the top 20 (otherwise it could not be closed or funded).
+        let measured = data::with_held(&candidates, &lots, &held);
+        app.cache.put_instruments(&measured)?;
         let stale = app
             .rules_at
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_none_or(|t| t.elapsed() >= RULES_REFRESH);
         if stale {
-            let rules = app.client.fetch_rules(&app.creds, &candidates).await?;
+            let rules = app.client.fetch_rules(&app.creds, &measured).await?;
             app.cache.put_rules(&rules)?;
 
             *app.rules_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -524,8 +540,9 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // mirrored; margin committed elsewhere on the account is reserved).
         let account = app.client.usdt_account(&app.creds).await?;
         let balance = account.wallet;
-        // NOTE(agents): Universe = top 20 by 24h turnover among the top 20 that have complete Bybit
-        //               rules (user requirement: drop coins without margin data).
+        // NOTE(agents): Universe = the top 20 candidates by 24h turnover that have complete Bybit
+        //               rules (user requirement: drop coins without margin data). Held coins outside
+        //               it are still measured (`data::with_held`) and managed, never re-entered.
         let lots = data::universe(
             &candidates,
             &app.cache.rules_symbols()?,

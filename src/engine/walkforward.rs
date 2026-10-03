@@ -1,44 +1,29 @@
-//! 14-day walk-forward over closed 15m bars of Bybit USDT perpetuals, shared by
-//! every engine (`run_wf`), plus the strategy grids.
+//! The parameter search over closed 15m bars of Bybit USDT perpetuals, plus the
+//! strategy grids.
 //!
-//! 1344 bars = 3 windows of 8 days in-sample (768) + 2 days out-of-sample
-//! (192), stepping 2 days. Params are chosen on each in-sample window only
-//! (and must survive all earlier data: no liquidation, drawdown <= 25%), then
-//! judged on the next unseen 2 days. The best params on the most recent 8 days
-//! challenge the params paper is using; `choose_live` keeps whichever scores
-//! higher on that data among those passing the two safety rules (no
-//! liquidation, drawdown <= 25% over the 14 days).
-//!
-//! The walk-forward check (`passed`): zero liquidations anywhere, out-of-sample
-//! profit factor > 1.2 and net > 0, the net still > 0 without the single best
-//! window, at least MIN_OOS_TRADES trades, final params profitable and
-//! liquidation-free over the 14 days with drawdown <= 25%. It is reported as
-//! information about the selection method; it does not gate paper trading.
+//! User rule (2026-10-03): ONE window of exactly 14 days (1,344 bars), never
+//! split into in-sample and out-of-sample parts. `search_full` backtests every
+//! combination over the whole window; usable settings pass the two safety rules
+//! (no liquidation, drawdown <= 25%) with at least `MIN_TRADES` trades, and the
+//! best by `objective` challenges the settings paper is using (`choose_live`).
+//! The honest check without splitting a window is chronological: choose on one
+//! 14-day window, trade the next, never-seen one (dashboard chart, research).
 
 use super::governor;
 use super::metrics::Metrics;
 use super::scores::Score;
-use super::{Market, BARS, BAR_MS};
+use super::{Market, BARS};
 use anyhow::{bail, Result};
 use serde::Serialize;
 use std::time::Instant;
 
-pub const IS_BARS: usize = 768;
-pub const OOS_BARS: usize = 192;
-pub const WINDOW_STARTS: [usize; 3] = [0, 192, 384];
 /// The top 20 Bybit token USDT perpetuals by 24h turnover that have complete
 /// Bybit rules (lot filter, account fee, margin tiers, measured order book).
 pub const UNIVERSE: usize = 20;
 /// Measure only the selected top 20. Missing rules reduce the count; do not
 /// scan additional candidates beyond the user's cap.
 pub const CANDIDATES: usize = UNIVERSE;
-pub const MIN_IS_TRADES: usize = 8;
-pub const MIN_OOS_TRADES: usize = 8;
 pub const MAX_DRAWDOWN_PCT: f64 = 25.0;
-// NOTE(agents): These thresholds define the walk-forward CHECK, reported as information since
-//               2026-10-03. The rules that stop trading are the two safety rules in `live_score`
-//               (no liquidation, drawdown <= MAX_DRAWDOWN_PCT). Don't relax those to get trades.
-pub const MIN_PROFIT_FACTOR: f64 = 1.2;
 
 fn objective(m: &Metrics) -> f64 {
     m.return_pct() - 0.5 * m.max_drawdown_pct
@@ -49,16 +34,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_grid_is_long_only_calm_dip() {
-        let g = live_grid();
-        assert_eq!(g.len(), 10_000);
-        let mut keys: Vec<String> = g.iter().map(|p| format!("{p:?}")).collect();
+    fn live_grid_covers_every_parameter_value_once() {
+        assert_eq!(LIVE_COMBOS, 2_949_120);
+        // Every index decodes to a distinct combination (checked on a dense
+        // stride plus both ends); every listed value of every parameter occurs.
+        let picks: Vec<usize> = (0..LIVE_COMBOS).step_by(97).chain([LIVE_COMBOS - 1]).collect();
+        let mut keys: Vec<String> = picks.iter().map(|&i| format!("{:?}", live_combo(i))).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 10_000, "every combination is distinct");
-        assert!(g
-            .iter()
-            .all(|p| p.long_only && !p.flip && p.signal == Signal::CalmDip));
+        assert_eq!(keys.len(), picks.len());
+        let all: Vec<XsParams> = (0..LIVE_COMBOS).step_by(7).map(live_combo).collect();
+        assert!(all.iter().all(|p| p.long_only));
+        for (s, lb, flip) in signal_variants() {
+            assert!(all.iter().any(|p| p.signal == s && p.lookback == lb && p.flip == flip));
+        }
+        for h in HOLDS {
+            assert!(all.iter().any(|p| p.hold == h));
+        }
+        assert!(all.iter().any(|p| p.risk.vol_scaled) && all.iter().any(|p| !p.risk.vol_scaled));
+        assert!(all.iter().any(|p| p.risk.add_pct.is_some() && p.risk.breaker_pct.is_some()));
     }
 
     #[test]
@@ -96,120 +90,98 @@ mod tests {
         assert_eq!(pick::<&str>(None, None), (None, Choice::NoneSafe));
     }
 
-    #[test]
-    fn windows_fit_14_days() {
-        assert_eq!(BARS, 1344);
-        assert_eq!(WINDOW_STARTS[2] + IS_BARS + OOS_BARS, BARS);
-    }
-
-    #[test]
-    fn rejects_anything_but_14_days() {
-        let ts: Vec<i64> = (0..100).map(|i| i * BAR_MS).collect();
-        let r = run_wf(
-            &ts,
-            &[0u8],
-            100.0,
-            Instant::now() + std::time::Duration::from_secs(5),
-            |_, _| Metrics::default(),
-        );
-        assert!(r.is_err());
-    }
-
-    /// Out-of-sample windows -27 / +20 / +241: the total is positive and PF is
-    /// high, but without the best window it loses, so it must not PASS.
-    #[test]
-    fn a_single_lucky_window_cannot_pass() {
-        let ts: Vec<i64> = (0..BARS as i64).map(|i| i * BAR_MS).collect();
-        let window_net = |start: usize| match start {
-            768 => -27.0,
-            960 => 20.0,
-            1152 => 241.0,
-            _ => 50.0, // in-sample and full-period runs
-        };
-        let bt = |_: &u8, r: std::ops::Range<usize>| {
-            let net = if r.end - r.start == OOS_BARS {
-                window_net(r.start)
-            } else {
-                50.0
-            };
-            let (gp, gl) = if net > 0.0 {
-                (net * 2.0, net)
-            } else {
-                (10.0, 10.0 - net)
-            };
-            Metrics {
-                start_equity: 1000.0,
-                end_equity: 1000.0 + net,
-                trades: 20,
-                wins: 12,
-                gross_profit: gp,
-                gross_loss: gl,
-                ..Default::default()
-            }
-        };
-        let r = run_wf(
-            &ts,
-            &[0u8],
-            1000.0,
-            Instant::now() + std::time::Duration::from_secs(5),
-            bt,
-        )
-        .unwrap();
-        assert_eq!(r.positive_windows, 2);
-        assert!((r.net_without_best - (-7.0)).abs() < 1e-9);
-        assert!(!r.passed);
-        assert!(
-            r.reasons.iter().any(|x| x.contains("rests on one window")),
-            "{:?}",
-            r.reasons
-        );
-    }
 }
 
-// ---------------------------------------------------------------- cross-sectional (xs)
+// ---------------------------------------------------------------- grids
 
 use super::xs::{self, Regime, Signal, XsParams};
 
-// NOTE(agents): The user chose 10,000 combinations (2026-10-03). Keep the SIGNAL and its direction
-//               fixed by evidence (signal_ic), not P&L. A wide search finds lucky settings more
-//               easily; the champion rule (replace only on a strictly higher score) and the two
-//               safety rules in `live_score` are what keep it in check. Don't remove them.
-/// The paper strategy: long only, buying calm dips (`Signal::CalmDip`
-/// unflipped: the direction comes from the full-universe signal study in
-/// examples/signal_ic.rs, not from P&L). 10,000 combinations (user request,
-/// 2026-10-03): hold 2h-72h (10), 1-5 coins (5), 1/2/3/5x (4), stop none or
-/// 5-20% (5), take-profit none or 5-40% (5), BTC filter off/on (2). Not a
-/// profitability claim (see docs/validation.md).
-pub fn live_grid() -> Vec<XsParams> {
-    let mut out = Vec::with_capacity(10_000);
-    for hold in [8usize, 16, 24, 32, 48, 64, 96, 144, 192, 288] {
-        for top in 1..=5usize {
-            for gross_leverage in [1.0, 2.0, 3.0, 5.0] {
-                for stop_pct in [None, Some(5.0), Some(10.0), Some(15.0), Some(20.0)] {
-                    for take_profit_pct in [None, Some(5.0), Some(10.0), Some(20.0), Some(40.0)] {
-                        for regime in [Regime::Off, Regime::BtcTrend] {
-                            out.push(XsParams {
-                                signal: Signal::CalmDip,
-                                flip: false,
-                                lookback: 0,
-                                hold,
-                                top,
-                                gross_leverage,
-                                stop_pct,
-                                risk: xs::Risk {
-                                    take_profit_pct,
-                                    ..Default::default()
-                                },
-                                long_only: true,
-                                regime,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+// NOTE(agents): User rule (2026-10-03): "test all". The live search varies EVERY strategy
+//               parameter: all 8 signals in both directions (Return at two lookbacks), hold,
+//               basket size, leverage, intrabar stop, take-profit, close-based stop, averaging
+//               down, drawdown breaker, half-size after drawdown, volatility sizing and the BTC
+//               filter. Value lists are sized so one search takes ~20 min (about 0.4 ms per
+//               14-day backtest); adding values multiplies the time. Long only is a user rule.
+const HOLDS: [usize; 8] = [8, 16, 24, 32, 64, 96, 144, 192];
+const TOPS: [usize; 5] = [1, 2, 3, 4, 5];
+const LEVERAGES: [f64; 4] = [1.0, 2.0, 3.0, 5.0];
+const STOPS: [Option<f64>; 4] = [None, Some(5.0), Some(10.0), Some(20.0)];
+const TAKE_PROFITS: [Option<f64>; 4] = [None, Some(5.0), Some(10.0), Some(40.0)];
+const CLOSE_STOPS: [Option<f64>; 2] = [None, Some(10.0)];
+const ADDS: [Option<f64>; 2] = [None, Some(10.0)];
+const BREAKERS: [Option<f64>; 2] = [None, Some(15.0)];
+const DERISKS: [Option<f64>; 2] = [None, Some(10.0)];
+const VOL_SCALED: [bool; 2] = [false, true];
+const REGIMES: [Regime; 2] = [Regime::Off, Regime::BtcTrend];
+
+/// (signal, lookback, flip) for every signal: unflipped buys the lowest values,
+/// flipped the highest; `Return` at each of its lookbacks. 18 variants.
+fn signal_variants() -> Vec<(Signal, usize, bool)> {
+    XS_SIGNALS
+        .iter()
+        .flat_map(|&s| {
+            lookbacks(s)
+                .iter()
+                .flat_map(move |&lb| [false, true].map(|flip| (s, lb, flip)))
+        })
+        .collect()
+}
+
+/// Combinations in the live grid: 18 × 8 × 5 × 4 × 4 × 4 × 2⁶ = 2,949,120.
+pub const LIVE_COMBOS: usize = 18
+    * HOLDS.len()
+    * TOPS.len()
+    * LEVERAGES.len()
+    * STOPS.len()
+    * TAKE_PROFITS.len()
+    * CLOSE_STOPS.len()
+    * ADDS.len()
+    * BREAKERS.len()
+    * DERISKS.len()
+    * VOL_SCALED.len()
+    * REGIMES.len();
+
+/// Live-grid combination `i` (0..LIVE_COMBOS), decoded in mixed radix so the
+/// grid is never materialised. Not a profitability claim (docs/validation.md).
+pub fn live_combo(i: usize) -> XsParams {
+    let mut r = i;
+    let mut take = |n: usize| {
+        let d = r % n;
+        r /= n;
+        d
+    };
+    let regime = REGIMES[take(REGIMES.len())];
+    let vol_scaled = VOL_SCALED[take(VOL_SCALED.len())];
+    let derisk_pct = DERISKS[take(DERISKS.len())];
+    let breaker_pct = BREAKERS[take(BREAKERS.len())];
+    let add_pct = ADDS[take(ADDS.len())];
+    let close_stop_pct = CLOSE_STOPS[take(CLOSE_STOPS.len())];
+    let take_profit_pct = TAKE_PROFITS[take(TAKE_PROFITS.len())];
+    let stop_pct = STOPS[take(STOPS.len())];
+    let gross_leverage = LEVERAGES[take(LEVERAGES.len())];
+    let top = TOPS[take(TOPS.len())];
+    let hold = HOLDS[take(HOLDS.len())];
+    let (signal, lookback, flip) = signal_variants()[take(18)];
+    XsParams {
+        signal,
+        flip,
+        lookback,
+        hold,
+        top,
+        gross_leverage,
+        stop_pct,
+        risk: xs::Risk {
+            close_stop_pct,
+            take_profit_pct,
+            add_pct,
+            breaker_pct,
+            vol_scaled,
+            derisk_pct,
+            short_stop_pct: None,
+        },
+        long_only: true,
+        regime,
     }
-    out
 }
 
 /// Every ranking signal (screener scores, return, funding).
@@ -310,199 +282,6 @@ pub fn xs_family_grid(signal: Signal) -> Vec<XsParams> {
     out
 }
 
-// ---------------------------------------------------------------- generic walk-forward
-
-/// One in-sample/out-of-sample window of a walk-forward.
-#[derive(Debug, Clone, Serialize)]
-pub struct WfWindow<P> {
-    pub is_bars: (usize, usize),
-    pub oos_bars: (usize, usize),
-    pub params: Option<P>,
-    pub in_sample: Option<Metrics>,
-    pub out_of_sample: Option<Metrics>,
-}
-
-/// 14-day walk-forward result for any strategy with params `P`.
-#[derive(Debug, Clone, Serialize)]
-pub struct WfReport<P> {
-    pub first_bar_ts: i64,
-    pub last_bar_ts: i64,
-    pub start_equity: f64,
-    pub evaluated: usize,
-    pub elapsed_ms: u128,
-    pub windows: Vec<WfWindow<P>>,
-    pub oos: Metrics,
-    pub params: Option<P>,
-    pub final_in_sample: Option<Metrics>,
-    pub full_period: Option<Metrics>,
-    /// Unseen windows that made money (out of WINDOW_STARTS.len()).
-    pub positive_windows: usize,
-    /// Out-of-sample net with the single best window removed: a pass must not
-    /// rest on one lucky stretch.
-    pub net_without_best: f64,
-    pub passed: bool,
-    pub reasons: Vec<String>,
-}
-
-pub type XsReport = WfReport<XsParams>;
-
-/// Best params on `range` by objective, among those that trade enough, never
-/// liquidate, and survive all data up to range.end (no liquidation, DD cap).
-fn wf_best<P: Clone>(
-    grid: &[P],
-    range: std::ops::Range<usize>,
-    bt: &dyn Fn(&P, std::ops::Range<usize>) -> Metrics,
-    deadline: Instant,
-    evaluated: &mut usize,
-) -> Result<Option<(P, Metrics)>> {
-    let gov = governor::global();
-    let mut best: Option<(f64, P, Metrics)> = None;
-    for p in grid {
-        gov.checkpoint(deadline)?;
-        *evaluated += 1;
-        let r = bt(p, range.clone());
-        if r.execution_error.is_some() || r.liquidations > 0 || r.trades < MIN_IS_TRADES {
-            continue;
-        }
-        let survival = bt(p, 0..range.end);
-        if survival.execution_error.is_some()
-            || survival.liquidations > 0
-            || survival.max_drawdown_pct > MAX_DRAWDOWN_PCT
-        {
-            continue;
-        }
-        let score = objective(&r);
-        if best.as_ref().is_none_or(|b| score > b.0) {
-            best = Some((score, p.clone(), r));
-        }
-    }
-    Ok(best.map(|(_, p, m)| (p, m)))
-}
-
-/// The 14-day walk-forward with the gates in this module's docs. `bt(p, range)`
-/// must backtest params `p` over bar range `range` from the start equity, using
-/// only data up to range.end (the engines are causal; see their tests).
-pub fn run_wf<P: Clone>(
-    ts: &[i64],
-    grid: &[P],
-    equity: f64,
-    deadline: Instant,
-    bt: impl Fn(&P, std::ops::Range<usize>) -> Metrics,
-) -> Result<WfReport<P>> {
-    if ts.len() != BARS || ts.windows(2).any(|w| w[1] - w[0] != BAR_MS) {
-        bail!(
-            "walk-forward needs exactly {BARS} contiguous 15m bars (14 days), got {}",
-            ts.len()
-        );
-    }
-    let started = Instant::now();
-    let mut evaluated = 0;
-    let mut windows = Vec::new();
-    let mut oos = Metrics {
-        start_equity: equity,
-        end_equity: equity,
-        ..Default::default()
-    };
-    for &s in &WINDOW_STARTS {
-        let (is_r, oos_r) = (s..s + IS_BARS, s + IS_BARS..s + IS_BARS + OOS_BARS);
-        let best = wf_best(grid, is_r.clone(), &bt, deadline, &mut evaluated)?;
-        let (params, is_m, oos_m) = match best {
-            Some((p, is_m)) => {
-                let o = bt(&p, oos_r.clone());
-                if o.execution_error.is_some() {
-                    oos.execution_error = o.execution_error.clone();
-                }
-                oos.rejected_rebalances += o.rejected_rebalances;
-                oos.trades += o.trades;
-                oos.wins += o.wins;
-                oos.gross_profit += o.gross_profit;
-                oos.gross_loss += o.gross_loss;
-                oos.liquidations += o.liquidations;
-                oos.max_drawdown_pct = oos.max_drawdown_pct.max(o.max_drawdown_pct);
-                oos.end_equity += o.net();
-                (Some(p), Some(is_m), Some(o))
-            }
-            None => (None, None, None),
-        };
-        windows.push(WfWindow {
-            is_bars: (is_r.start, is_r.end),
-            oos_bars: (oos_r.start, oos_r.end),
-            params,
-            in_sample: is_m,
-            out_of_sample: oos_m,
-        });
-    }
-    let final_best = wf_best(grid, BARS - IS_BARS..BARS, &bt, deadline, &mut evaluated)?;
-    let full = final_best.as_ref().map(|(p, _)| bt(p, 0..BARS));
-    let nets: Vec<f64> = windows
-        .iter()
-        .map(|w| w.out_of_sample.as_ref().map_or(0.0, |o| o.net()))
-        .collect();
-    let positive_windows = nets.iter().filter(|&&n| n > 0.0).count();
-    let best = nets.iter().cloned().fold(0.0, f64::max);
-    let net_without_best = nets.iter().sum::<f64>() - best;
-    let mut reasons = Vec::new();
-    if let Some(e) = &oos.execution_error {
-        reasons.push(format!("invalid out-of-sample execution: {e}"));
-    }
-    if windows.iter().any(|w| w.params.is_none()) {
-        reasons.push("a window had no params that traded enough without liquidating".into());
-    }
-    if oos.liquidations > 0 {
-        reasons.push(format!("{} out-of-sample liquidation(s)", oos.liquidations));
-    }
-    if net_without_best <= 0.0 {
-        reasons.push(format!("profit rests on one window: out-of-sample net without the best window {net_without_best:+.2} (need > 0)"));
-    }
-    if oos.trades < MIN_OOS_TRADES {
-        reasons.push(format!(
-            "only {} out-of-sample trades (need {MIN_OOS_TRADES})",
-            oos.trades
-        ));
-    }
-    if oos.profit_factor() <= MIN_PROFIT_FACTOR {
-        reasons.push(format!(
-            "out-of-sample profit factor {:.2} (need > {MIN_PROFIT_FACTOR})",
-            oos.profit_factor()
-        ));
-    }
-    if oos.net() <= 0.0 {
-        reasons.push(format!("out-of-sample net {:.2} (need > 0)", oos.net()));
-    }
-    match &full {
-        Some(f) if f.execution_error.is_some() => {
-            reasons.push(format!("invalid final execution: {:?}", f.execution_error))
-        }
-        None => reasons.push("no params qualified on the most recent 8 days".into()),
-        Some(f) if f.liquidations > 0 => {
-            reasons.push("final params liquidate within the 14 days".into())
-        }
-        Some(f) if f.max_drawdown_pct > MAX_DRAWDOWN_PCT => {
-            reasons.push(format!("final params drawdown {:.1}%", f.max_drawdown_pct))
-        }
-        Some(f) if f.net() <= 0.0 => {
-            reasons.push(format!("final params lose {:.2} over 14 days", f.net()))
-        }
-        _ => {}
-    }
-    Ok(WfReport {
-        first_bar_ts: ts[0],
-        last_bar_ts: ts[BARS - 1],
-        start_equity: equity,
-        evaluated,
-        elapsed_ms: started.elapsed().as_millis(),
-        windows,
-        oos,
-        params: final_best.as_ref().map(|(p, _)| p.clone()),
-        final_in_sample: final_best.map(|(_, m)| m),
-        full_period: full,
-        positive_windows,
-        net_without_best,
-        passed: reasons.is_empty(),
-        reasons,
-    })
-}
-
 /// How this bar's paper settings were chosen (champion/challenger).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Choice {
@@ -534,29 +313,93 @@ pub fn pick<P: Clone + PartialEq>(
     }
 }
 
-/// Score of `p` for live use, with the same rules the search applies: its
-/// objective on the latest `IS_BARS` if it trades at least `MIN_IS_TRADES`
-/// times there without liquidating, and survives all 14 days (no execution
-/// error, no liquidation, drawdown within the cap). `None` = not usable now.
+/// Minimum closed trades over the 14 days for settings to be usable.
+pub const MIN_TRADES: usize = 8;
+
+// NOTE(agents): User rule (2026-10-03): the live search uses ONE 14-day window, never split into
+//               in-sample/out-of-sample parts. Usable = the two safety rules (no liquidation,
+//               drawdown <= MAX_DRAWDOWN_PCT) plus at least MIN_TRADES trades and no execution
+//               error, all over the full 14 days.
+fn usable(r: &Metrics) -> bool {
+    r.execution_error.is_none()
+        && r.liquidations == 0
+        && r.max_drawdown_pct <= MAX_DRAWDOWN_PCT
+        && r.trades >= MIN_TRADES
+}
+
+/// Score of `p` for live use: its objective over the full 14 days if usable
+/// there (`usable`). `None` = not usable now.
 pub fn live_score(
     m: &Market,
     scores: &[Vec<Option<Score>>],
     equity: f64,
     p: &XsParams,
 ) -> Option<f64> {
-    let recent = xs::backtest(m, scores, BARS - IS_BARS..BARS, p, equity).metrics();
-    if recent.execution_error.is_some() || recent.liquidations > 0 || recent.trades < MIN_IS_TRADES
-    {
-        return None;
+    let r = xs::backtest(m, scores, 0..BARS, p, equity).metrics();
+    usable(&r).then(|| objective(&r))
+}
+
+/// One full-window parameter search.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchReport {
+    pub first_bar_ts: i64,
+    pub last_bar_ts: i64,
+    pub start_equity: f64,
+    /// Combinations in the grid, and how many were backtested before the deadline.
+    pub combos: usize,
+    pub evaluated: usize,
+    /// Combinations that passed the safety rules and the minimum trade count.
+    pub usable: usize,
+    pub elapsed_ms: u128,
+    /// The best usable settings by `objective` over the 14 days, with their metrics.
+    pub params: Option<XsParams>,
+    pub metrics: Option<Metrics>,
+}
+
+/// Backtest combinations `0..combos` (built by `combo(i)`, so millions never sit
+/// in memory) over the full 14 days (`BARS`, no split) and keep the best usable
+/// one by `objective`.
+pub fn search_full(
+    m: &Market,
+    scores: &[Vec<Option<Score>>],
+    equity: f64,
+    deadline: Instant,
+    combos: usize,
+    combo: impl Fn(usize) -> XsParams,
+) -> Result<SearchReport> {
+    m.validate()?;
+    if m.ts.len() != BARS {
+        bail!("search needs exactly {BARS} bars (14 days), got {}", m.ts.len());
     }
-    let all = xs::backtest(m, scores, 0..BARS, p, equity).metrics();
-    if all.execution_error.is_some()
-        || all.liquidations > 0
-        || all.max_drawdown_pct > MAX_DRAWDOWN_PCT
-    {
-        return None;
+    let started = Instant::now();
+    let gov = governor::global();
+    let (mut evaluated, mut usable_n) = (0, 0);
+    let mut best: Option<(f64, XsParams, Metrics)> = None;
+    for i in 0..combos {
+        gov.checkpoint(deadline)?;
+        evaluated += 1;
+        let p = combo(i);
+        let r = xs::backtest(m, scores, 0..BARS, &p, equity).metrics();
+        if !usable(&r) {
+            continue;
+        }
+        usable_n += 1;
+        let score = objective(&r);
+        if best.as_ref().is_none_or(|b| score > b.0) {
+            best = Some((score, p, r));
+        }
     }
-    Some(objective(&recent))
+    Ok(SearchReport {
+        first_bar_ts: m.ts[0],
+        last_bar_ts: m.ts[BARS - 1],
+        start_equity: equity,
+        combos,
+        evaluated,
+        usable: usable_n,
+        elapsed_ms: started.elapsed().as_millis(),
+        params: best.as_ref().map(|b| b.1.clone()),
+        metrics: best.map(|b| b.2),
+    })
 }
 
 /// The settings paper trades this bar: the search's best (`challenger`) or
@@ -574,15 +417,3 @@ pub fn choose_live(
     pick(score(challenger), score(champion))
 }
 
-pub fn run_xs_with(
-    m: &Market,
-    scores: &[Vec<Option<Score>>],
-    equity: f64,
-    deadline: Instant,
-    grid: &[XsParams],
-) -> Result<XsReport> {
-    m.validate()?;
-    run_wf(&m.ts, grid, equity, deadline, |p, r| {
-        xs::backtest(m, scores, r, p, equity).metrics()
-    })
-}

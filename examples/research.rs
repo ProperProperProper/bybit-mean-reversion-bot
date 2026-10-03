@@ -3,9 +3,10 @@
 //!   W1 2026-08-20..09-03, W2 09-03..09-17, W3 09-17..10-01 (UTC, 08:30).
 //! For each signal family (screener scores, return, funding) and for all of
 //! them together:
-//!   - the full 14-day walk-forward inside every window (must pass in ALL three);
-//!   - a chronological forward test: params the walk-forward picks at the end of
-//!     window k trade window k+1, which they have never seen (at 1x and 2x costs).
+//!   - a full-window search inside every window (one 14-day window, no split;
+//!     the best usable settings are in-sample by construction);
+//!   - a chronological forward test: the settings chosen on window k trade
+//!     window k+1, which they have never seen (at 1x and 2x costs).
 //!
 //! Run `fetch_research_data` first (window_1.db, window_2.db, window_3.db).
 use bybit_mean_reversion_bot::engine::{research, scores, walkforward, xs, Market, BARS};
@@ -83,12 +84,13 @@ fn main() -> anyhow::Result<()> {
         let started = Instant::now();
         let reports: Vec<_> = (0..3)
             .map(|k| {
-                walkforward::run_xs_with(
+                walkforward::search_full(
                     &markets[k],
                     &sc[k],
                     eq,
                     Instant::now() + Duration::from_secs(7200),
-                    grid,
+                    grid.len(),
+                    |i| grid[i].clone(),
                 )
             })
             .collect::<anyhow::Result<_>>()?;
@@ -98,24 +100,21 @@ fn main() -> anyhow::Result<()> {
             started.elapsed().as_secs_f64()
         );
         for (k, r) in reports.iter().enumerate() {
-            println!(
-                "  W{} walk-forward {:6}  OOS net {:+7.2}  PF {:5.2}  trades {:4}  liq {}{}",
-                k + 1,
-                if r.passed { "PASS" } else { "fail" },
-                r.oos.net(),
-                r.oos.profit_factor(),
-                r.oos.trades,
-                r.oos.liquidations,
-                if r.passed {
-                    String::new()
-                } else {
-                    format!("  ({})", r.reasons.join("; "))
-                }
-            );
+            match &r.metrics {
+                Some(m) => println!(
+                    "  W{} best of {} usable: 14-day net {:+7.2} PF {:5.2} trades {:4} (in-sample: chosen on this window)",
+                    k + 1,
+                    r.usable,
+                    m.net(),
+                    m.profit_factor(),
+                    m.trades
+                ),
+                None => println!("  W{}: no usable settings", k + 1),
+            }
         }
         for (k, report) in reports.iter().enumerate().take(2) {
             let Some(p) = &report.params else {
-                println!("  forward W{}->W{}: no params qualified", k + 1, k + 2);
+                println!("  forward W{}->W{}: no usable settings", k + 1, k + 2);
                 continue;
             };
             let a = xs::backtest_costs(&all, &sc_all, (k + 1) * BARS..(k + 2) * BARS, p, eq, 1.0)

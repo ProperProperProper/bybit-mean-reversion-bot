@@ -8,7 +8,7 @@
 //! * `scores` — the screener: volatility, price action, volume, activity rank,
 //!   trend score and Pulse, computed causally from closed bars.
 //! * `xs` — the strategy: cross-sectional ranking, market-neutral or long only
-//!   (live: long-only `Signal::CalmDip`, `walkforward::live_grid`), with an
+//!   (live: long-only, settings from `walkforward::search_full` over every parameter), with an
 //!   optional BTC trend filter and drawdown rules.
 //! * `walkforward` — the 14-day walk-forward gate and the strategy grids.
 //! * `metrics` — trade records and performance metrics.

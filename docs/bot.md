@@ -5,7 +5,7 @@ Paper trading and signals only. It never places orders.
 ## `main.rs`
 
 - `bot serve`: the paper-trading service, using the runtime folder.
-- `bot backtest`: one historical simulation using the paper engine (real balance, current top 20, rules measured now, 14 days synced), printing the walk-forward report as JSON.
+- `bot backtest`: one historical simulation using the paper engine (real free balance, current top 20, rules measured now, 14 days synced), printing the full-window search report as JSON.
 
 ## `service.rs`
 
@@ -37,7 +37,7 @@ Loads the paper account, the Keychain credentials and the real balance (no crede
 
 ### `forward_test_daily(dir, start)`
 
-The console chart: settings chosen by the live walk-forward on research window 2 trade window 3, joined so the screener keeps its look-back. Totals plus one row per UTC day. A simulation error or unclosed final position rejects the chart instead of publishing partial results.
+The console chart: settings chosen by the live full-window search on research window 2 trade window 3 (never seen), joined so the screener keeps its look-back. Totals plus one row per UTC day. A simulation error or unclosed final position rejects the chart instead of publishing partial results.
 
 ### `bar_task`: once per closed 15-minute bar
 
@@ -53,11 +53,11 @@ Any error ends the run and the supervisor restarts it.
 
 ### `search_task`: the parameter search
 
-Runs the walk-forward over `live_grid()` (10,000 combinations, about 40,000 evaluations, about 20 s on 20 coins) on the newest market, then `walkforward::choose_live` against the settings in use, and stores the result for `bar_task`. The next search starts `SEARCH_PAUSE` (60 min) after this one **finishes**. A failed or timed-out search keeps the previous result and retries after `SEARCH_RETRY`. Its stall limit is `SEARCH_DEADLINE` + 10 min because the task cannot send heartbeats while the search runs.
+Backtests every live-grid combination (`walkforward::LIVE_COMBOS`, 2,949,120, about 20 minutes on 20 coins) over the newest 14-day market with `walkforward::search_full`, then `walkforward::choose_live` against the settings in use, and stores the result for `bar_task`. After its first search it builds the dashboard's forward-test chart (choose on research window 2 with the same full search, trade window 3), so the two searches don't share the CPU budget. The next search starts `SEARCH_PAUSE` (60 min) after this one **finishes**. A failed or timed-out search keeps the previous result and retries after `SEARCH_RETRY`. Its stall limit is `SEARCH_DEADLINE` + 10 min because the task cannot send heartbeats while the search runs.
 
 ### `console`
 
-A minimal HTTP server: `/` (the page), `/api/status`, `/api/signals`, `/api/research`, all `no-store`. The page shows the real balance and the margin committed elsewhere, paper equity and P&L, the dynamic allocation (pairs funded and why, including the 5 USDT floor), positions, next targets, the event log, recent trades, the walk-forward verdict, and the 14-day forward-test chart. It reloads itself when the service restarts.
+A minimal HTTP server: `/` (the page), `/api/status`, `/api/signals`, `/api/research`, all `no-store`. The page shows the real balance and the margin committed elsewhere, paper equity and P&L, the dynamic allocation (pairs funded and why, including the 5 USDT floor), positions, next targets, the event log, recent trades, the parameter search (combinations, usable count, best settings and their in-sample 14-day result), and the 14-day forward-test chart. It reloads itself when the service restarts.
 
 ## Deployment (`deploy.sh`)
 

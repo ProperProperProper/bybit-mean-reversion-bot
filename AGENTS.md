@@ -36,7 +36,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - **Real data and real code paths only.** Never fill a missing candle, fee, tier or balance with an invented or default value. A missing input means "don't trade" or an explicit error.
 - **Top 20 only**, by 24h turnover among eligible Bybit token USDT perpetuals. Measure only those 20; incomplete rules reduce the universe rather than scanning extra candidates. Historical top-50 results below describe the former configuration, not validation of the new top-20 setup.
 - **Delisted tokens are hard-excluded** (user request): never fetched or entered, excluded held symbols stop paper with an explicit recovery error rather than fetch excluded contracts or fabricate exits, and `Cache::retain_symbols` deletes their stored rows every bar and in every research/holdout DB. Do not reintroduce delisted symbols anywhere, research included.
-- **Parameter search (user design, 2026-10-03):** 10,000 combinations; the next search starts 60 minutes after the previous one FINISHES (`search_task`), never per candle. Champion/challenger: paper keeps the settings in use unless the search's best scores strictly higher; the two safety rules (no liquidation, drawdown <= 25% over 14 days) always apply. The walk-forward check is information only.
+- **Parameter search (user rules, 2026-10-03):** ONE 14-day window, never split; test EVERY parameter (`walkforward::LIVE_COMBOS` = 2,949,120 combinations, all 8 signals both ways, about 20 min per search). The next search starts 60 minutes after the previous one FINISHES (`search_task`), never per candle. Champion/challenger: paper keeps the settings in use unless the search's best scores strictly higher; the two safety rules (no liquidation, drawdown <= 25% over the 14 days) always apply.
 - **5 USDT floor:** no entries or adds while the free balance (wallet minus margin committed anywhere on the account) is below 5 USDT.
 - No dead code. Strict clippy clean. The user works unattended: don't stop to ask, redeploy when needed, commit and push when done.
 - Report results honestly, including losses. Don't tune on the test windows until a number looks good.
@@ -46,14 +46,14 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - Repo (this folder) → GitHub `ProperProperProper/bybit-mean-reversion-bot`, branch `main`. The repo is **public**: never commit keys, balances or account details.
 - Runtime: `~/Library/Application Support/BybitMeanReversionBot` (`data.db`, `window_1..3.db`, `paper_xs.json`, `logs/bot.err`). launchd job `com.bybitmeanreversion.bot`; console http://127.0.0.1:8787.
 - Deploy: `./deploy.sh` (builds, runs every test, installs, restarts). It re-signs the binary with identifier `bot-06c819130362ed6a`. **Keep that:** the LuLu firewall allow rule matches path + signing identifier, and a new identifier makes the bot's connections hang on a firewall prompt.
-- LuLu also blocks any *new* binary that touches the network until someone clicks Allow. Example binaries with existing allow rules: `fetch_research_data`, `risk_variants`. For research, pass `EQ=<balance>` so nothing needs the network.
+- LuLu also blocks any *new* binary that touches the network until someone clicks Allow. Example binaries with an existing allow rule: `fetch_research_data`. For research, pass `EQ=<balance>` so nothing needs the network.
 - Never run tools against the live SQLite files: copy with `sqlite3 SRC ".backup DEST"` first.
 
 ## Current state (2026-10-02)
 
 - All findings in `docs/audit.md` are fixed with regression tests (mark-price funding/liquidation, isolated margin, neutral fills, lot rounding, risk-tier deductions, new listings, balance floor, and more).
-- Live grid: `walkforward::live_grid()` = long-only `Signal::CalmDip` (unflipped), 10,000 combinations (hold 2h–72h, 1–5 coins, 1/2/3/5×, stop none or 5–20%, take-profit none or 5–40%, BTC filter off/on), searched hourly by `search_task` with champion/challenger.
-- The walk-forward of the full strategy (relative edge + market exposure + costs) passes in 1 of 4 data sets; forward tests −9.8% and +21.9%. The signal has positive relative evidence on the tested sample; whether the long-only *account* makes money also depends on the market. See `docs/validation.md`.
+- Live grid: `walkforward::live_combo(i)` for `i < LIVE_COMBOS`: every parameter (see docs/walkforward.md), long only, searched by `search_task` over one 14-day window with champion/challenger.
+- (2026-10-02, old split walk-forward, since removed) the full strategy (relative edge + market exposure + costs) passed in 1 of 4 data sets; forward tests −9.8% and +21.9%. The signal has positive relative evidence on the tested sample; whether the long-only *account* makes money also depends on the market. See `docs/validation.md`.
 
 ## Evidence and traps
 
@@ -67,9 +67,9 @@ Keep them current: if you change the behaviour a note describes, update or remov
 ## Good next steps
 
 1. Let the paper account run on new data; compare it with equal-weight buy-and-hold of the same universe over the same days (the edge is relative to that).
-2. Make the walk-forward itself run on the broad universe (every eligible token ranked by turnover at the time, not today's top 20), with mark candles, listing times and funding. Delisted tokens stay excluded (user rule), so some survivorship bias remains; state it with any result.
+2. Make the search itself run on the broad universe (every eligible token ranked by turnover at the time, not today's top 20), with mark candles, listing times and funding. Delisted tokens stay excluded (user rule), so some survivorship bias remains; state it with any result.
 3. Test further entry ideas with `signal_ic` on the full universe *before* adding them to a grid. Only add signals whose sign holds in every window.
-4. Exits: a 24h hold is a blunt exit. Test take-profit / time-stop variants with `examples/risk_variants.rs` once the entry is settled.
+4. Judge the full search by its chronological forward results (dashboard chart, `examples/research.rs`), not by the best settings' in-sample 14-day result.
 
 ## Follow-up code review (2026-10-02, Codex)
 

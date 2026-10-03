@@ -62,7 +62,6 @@ fn main() -> Result<()> {
     let windows: Vec<Market> = (1..=3)
         .map(|k| research::load_window(dir, k))
         .collect::<Result<_>>()?;
-    let grid = walkforward::live_grid();
     let mut reports = Vec::new();
     let mut rows = Vec::new();
     for (i, m) in std::iter::once(&live).chain(windows.iter()).enumerate() {
@@ -72,23 +71,24 @@ fn main() -> Result<()> {
             format!("window_{i}")
         };
         eprintln!(
-            "evaluating {label}: {} symbols, {} settings",
+            "searching {label}: {} symbols, {} combinations over 14 days",
             m.symbols.len(),
-            grid.len()
+            walkforward::LIVE_COMBOS
         );
         let sc = scores::compute(m, walkforward::UNIVERSE);
-        let report = walkforward::run_xs_with(
+        let report = walkforward::search_full(
             m,
             &sc,
             equity,
-            Instant::now() + Duration::from_secs(600),
-            &grid,
+            Instant::now() + Duration::from_secs(3600),
+            walkforward::LIVE_COMBOS,
+            walkforward::live_combo,
         )?;
         let final_outcome = report
             .params
             .as_ref()
             .map(|p| outcome(&xs::backtest(m, &sc, 0..BARS, p, equity)));
-        rows.push(json!({"label":label,"coverage":coverage(m),"report":report,"final_settings_self_check":final_outcome}));
+        rows.push(json!({"label":label,"coverage":coverage(m),"search":report,"best_settings_in_sample":final_outcome}));
         if i > 0 {
             reports.push(report);
         }
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
     for (k, report) in reports.iter().enumerate().take(2) {
         let Some(p) = &report.params else {
             forwards.push(
-                json!({"from_window":k+1,"to_window":k+2,"error":"no qualifying parameters"}),
+                json!({"from_window":k+1,"to_window":k+2,"error":"no usable settings"}),
             );
             continue;
         };
@@ -110,9 +110,9 @@ fn main() -> Result<()> {
     }
     let output = json!({"generated_utc":chrono::Utc::now().to_rfc3339(),"start_equity":equity,
         "equity_source":"caller-provided observed account balance; not fetched during this run",
-        "grid":"current live_grid: Pulse family, both flips, no optional risk rule",
-        "warning":"Current engine has outstanding audit defects. These are diagnostic simulation results, not validated profitability or executable live returns.",
-        "walkforwards":rows,"chronological_forwards":forwards});
+        "grid":"live grid: every parameter, walkforward::LIVE_COMBOS combinations, one 14-day window each",
+        "warning":"Historical simulation with the paper engine. The best settings per window are chosen on that window (in-sample); only the chronological forwards trade unseen data.",
+        "searches":rows,"chronological_forwards":forwards});
     std::fs::write(&args[2], serde_json::to_string_pretty(&output)?)?;
     eprintln!("saved {}", args[2]);
     Ok(())

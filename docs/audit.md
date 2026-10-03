@@ -2,7 +2,7 @@
 
 This page tracks every finding from the 1 October audit and the follow-up audit of 2 October, with its current state in the code. "Fixed" means the code changed and a regression test covers it; the test is named. Everything listed is in the committed tree, which was deployed with a fresh-data reset on 2026-10-02.
 
-The earlier findings have fixes, with the additional qualifications below. With them fixed, the old market-neutral Pulse strategy failed its validation on real data. The live strategy is now long-only CalmDip, whose entry signal met pre-registered out-of-sample thresholds as a **relative** edge; the full strategy passes its walk-forward on 1 of 4 data sets ([validation.md](validation.md)). Since 2026-10-03 paper trades the best settings that pass the two safety rules; the walk-forward check is information, not a gate.
+The earlier findings have fixes, with the additional qualifications below. With them fixed, the old market-neutral Pulse strategy failed its validation on real data. The live strategy is now long-only CalmDip, whose entry signal met pre-registered out-of-sample thresholds as a **relative** edge; the full strategy passes its walk-forward on 1 of 4 data sets ([validation.md](validation.md)). Since 2026-10-03 paper trades the best settings from a full-window search that pass the two safety rules.
 
 ## Findings from the 1 October audit
 
@@ -85,3 +85,5 @@ Tests: `no_entries_or_adds_below_the_free_balance_floor`, `account_balance_reser
 - Removed the `Delisting` exit path: after the strict eligibility change, a held ineligible symbol stops the bar for explicit recovery before replay, so `exit_delisting` could no longer run (dead code).
 - Bybit's transient `retCode 10016` ("svc error") failed a research fetch and the first fresh sync on 2026-10-02; public and signed requests now retry it with backoff like rate limits.
 - **Fresh-start sync bug (fixed):** with only `start`, Bybit's kline endpoint returns the first 1000 candles after `start`, not the newest. Newest-first paging therefore stopped after one page, and every sync on an empty database missed the last 344 bars and failed until the retry filled the gap (seen on both 2026-10-02 resets, first attributed to Bybit). Requests now always send `end`.
+- **Search redesign (user rules, 2026-10-03):** the split walk-forward (`run_wf`, `run_xs_with`, `WfReport`, in-/out-of-sample constants) was removed. The live search backtests every parameter combination (`LIVE_COMBOS`) over one 14-day window with `search_full`, scored by `objective` among combinations passing the two safety rules; champion/challenger picks the settings paper uses. `examples/risk_variants.rs` was removed because the search itself now varies every risk rule. Keep in mind: the best settings' 14-day result is in-sample; the chronological forward chart is the out-of-sample check.
+

@@ -1,6 +1,6 @@
 # `src/engine/xs.rs`: the strategy engine
 
-A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned rebalance closes it ranks the universe by a `Signal`, then holds **long the `top` lowest values**, plus, unless `long_only`, **short the `top` highest** (market-neutral), equal notional per leg. The live strategy is long only. The same `step` function drives backtests, the walk-forward and paper trading, so there is no separate "live logic". Audit history: [audit.md](audit.md).
+A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned rebalance closes it ranks the universe by a `Signal`, then holds **long the `top` lowest values**, plus, unless `long_only`, **short the `top` highest** (market-neutral), equal notional per leg. The live strategy is long only. The same `step` function drives backtests, the parameter search and paper trading, so there is no separate "live logic". Audit history: [audit.md](audit.md).
 
 ## Constants
 
@@ -73,7 +73,7 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 | `execution_error` | Set when a data or execution precondition fails; the simulation stops instead of inventing a fill |
 | `rejected_rebalances` | Rebalances not placed because a leg failed or the sides were unbalanced |
 | `cost_mult` | Multiplier on measured fees and book costs (1 = as measured) |
-| `entries_allowed` | False while the walk-forward fails: no new positions |
+| `entries_allowed` | False when no settings pass the safety rules (or before the first search): no new positions |
 | peak / max drawdown, liquidations, breaker state | Running figures |
 
 ## Selection

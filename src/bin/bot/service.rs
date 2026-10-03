@@ -1,5 +1,5 @@
 //! Paper-trading service for the long-only "calm dip" strategy (see
-//! walkforward::live_grid) — never places orders.
+//! walkforward::live_combo, every parameter) — never places orders.
 //!
 //! bar_task (each 15m close): sync closed bars + funding for the universe
 //! (top 20 USDT perpetuals by 24h turnover with complete rules) -> scores ->
@@ -12,7 +12,7 @@
 use anyhow::Result;
 use bybit_mean_reversion_bot::engine::scores;
 use bybit_mean_reversion_bot::engine::supervisor::{Health, Heartbeat};
-use bybit_mean_reversion_bot::engine::walkforward::{self, XsReport};
+use bybit_mean_reversion_bot::engine::walkforward::{self, SearchReport};
 use bybit_mean_reversion_bot::engine::xs::{self, XsParams, XsPortfolio};
 use bybit_mean_reversion_bot::engine::{data, governor, keychain, research, Side, BARS, BAR_MS};
 use log::{error, info, warn};
@@ -62,9 +62,8 @@ pub struct Status {
     pub symbols: usize,
     pub universe: usize,
     pub sync_secs: f64,
-    pub report: Option<XsReport>,
+    pub report: Option<SearchReport>,
     pub params: Option<XsParams>,
-    pub validated: bool,
     /// How the settings in use were chosen by the latest search.
     pub choice: Option<walkforward::Choice>,
     /// When the latest parameter search finished (ms; 0 = none yet).
@@ -289,7 +288,7 @@ struct App {
 /// One completed parameter search (walk-forward + champion/challenger).
 #[derive(Clone)]
 struct Search {
-    report: XsReport,
+    report: SearchReport,
     chosen: Option<XsParams>,
     choice: walkforward::Choice,
     finished_ms: i64,
@@ -358,16 +357,6 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
         search: RwLock::new(None),
     });
 
-    let a = app.clone();
-    let free = balance - account.reserved();
-    tokio::task::spawn_blocking(move || match forward_test_daily(&a.dir, free) {
-        Ok(v) => *a.research.write().unwrap_or_else(|e| e.into_inner()) = Some(v),
-        Err(e) => {
-            warn!("forward test chart unavailable: {e:#}");
-            *a.research.write().unwrap_or_else(|e| e.into_inner()) =
-                Some(serde_json::json!({ "error": format!("{e:#}") }));
-        }
-    });
     let a = app.clone();
     health.spawn("bar_task", Duration::from_secs(1200), move |hb| {
         let a = a.clone();
@@ -438,15 +427,15 @@ fn forward_test_daily(dir: &Path, start: f64) -> Result<serde_json::Value> {
         .collect();
     let all = bybit_mean_reversion_bot::engine::Market::concat(&markets)?;
     let sc_all = scores::compute(&all, walkforward::UNIVERSE);
-    let grid = walkforward::live_grid();
     let mut pf = XsPortfolio::new(start);
     let mut days: Vec<xs::DayRow> = Vec::new();
-    let rep = walkforward::run_xs_with(
+    let rep = walkforward::search_full(
         &markets[0],
         &sc[0],
         start,
-        Instant::now() + Duration::from_secs(600),
-        &grid,
+        Instant::now() + SEARCH_DEADLINE,
+        walkforward::LIVE_COMBOS,
+        walkforward::live_combo,
     )?;
     let p = rep
         .params
@@ -791,7 +780,6 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         s.next_rebalance_ts = next_rebalance;
         s.symbols = symbols.len();
         s.sync_secs = sync_secs;
-        s.validated = search.as_ref().is_some_and(|x| x.report.passed);
         s.choice = choice;
         s.params = chosen.clone();
         s.search_finished_ms = search.as_ref().map_or(0, |x| x.finished_ms);
@@ -826,14 +814,11 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             Some(walkforward::Choice::NoneSafe) => "NO SAFE SETTINGS (flat)",
         }
         .into();
-        // The walk-forward verdict is information about the selection method; it
-        // no longer decides whether paper trades.
         let verdict = match search.as_ref().map(|x| &x.report) {
             None => "no search finished yet".to_string(),
-            Some(r) if r.passed => "walk-forward check passed".to_string(),
             Some(r) => format!(
-                "walk-forward check not passed (info): {}",
-                r.reasons.join("; ")
+                "last search: {} of {} combinations, {} usable",
+                r.evaluated, r.combos, r.usable
             ),
         };
         let summary = format!(
@@ -854,8 +839,9 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
     }
 }
 
-/// The parameter search: walk-forward over `live_grid()` (10,000 combinations)
-/// on the newest market, then champion/challenger against the settings in use.
+/// The parameter search: every live-grid combination (`walkforward::LIVE_COMBOS`)
+/// backtested over the full 14 days, then champion/challenger against the
+/// settings in use.
 /// It starts again `SEARCH_PAUSE` after each search finishes.
 async fn search_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
     loop {
@@ -879,17 +865,17 @@ async fn search_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                     .as_ref()
                     .and_then(|ps| ps.params.clone())
             });
-        let grid = walkforward::live_grid();
-        let combos = grid.len();
+        let combos = walkforward::LIVE_COMBOS;
         let started = Instant::now();
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
             let sc = scores::compute(&market, walkforward::UNIVERSE);
-            let report = walkforward::run_xs_with(
+            let report = walkforward::search_full(
                 &market,
                 &sc,
                 equity,
                 Instant::now() + SEARCH_DEADLINE,
-                &grid,
+                combos,
+                walkforward::live_combo,
             )?;
             let (chosen, choice) = walkforward::choose_live(
                 &market,
@@ -920,6 +906,25 @@ async fn search_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                     choice,
                     finished_ms: chrono::Utc::now().timestamp_millis(),
                 });
+                // The dashboard's chronological check (choose on research window 2, trade
+                // window 3) is built once, after the first live search, so the two full
+                // searches don't share the CPU budget.
+                let unbuilt = app
+                    .research
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none();
+                if unbuilt {
+                    let a = app.clone();
+                    let chart = tokio::task::spawn_blocking(move || forward_test_daily(&a.dir, equity))
+                        .await?;
+                    let value = chart.unwrap_or_else(|e| {
+                        warn!("forward test chart unavailable: {e:#}");
+                        serde_json::json!({ "error": format!("{e:#}") })
+                    });
+                    *app.research.write().unwrap_or_else(|e| e.into_inner()) = Some(value);
+                    hb.beat();
+                }
                 SEARCH_PAUSE
             }
             Err(e) => {
@@ -1018,7 +1023,7 @@ table{border-collapse:collapse;font-size:12px}td,th{padding:2px 8px;text-align:r
 <section><b>Live event log</b><pre id=ev></pre></section>
 <section><b>Recent paper trades</b><table id=tr></table></section>
 <section><b>Forward test, day by day</b> <span class=k>(historical simulation: settings chosen on the preceding 14 days, then tested on these 14 using the paper engine; current universe and execution measurements, simulated fills)</span><p class=k>Daily equity change includes realised and unrealised P&amp;L, fees and funding. Closed wins counts only profitable trades closed that day; equity can rise with zero closed wins.</p><div id=fsum class=k></div><div id=fchart></div><table id=fdays></table></section>
-<section><b>Walk-forward (14 days of 15m bars, re-run every bar)</b><pre id=wf></pre></section>
+<section><b>Parameter search (one 14-day window, every combination; next search 60 min after the last one finished)</b><pre id=wf></pre></section>
 <script>
 const f=(x,d=2)=>x==null||isNaN(x)?'-':Number(x).toFixed(d);
 const t=ms=>ms?new Date(ms).toLocaleString():'-';
@@ -1030,7 +1035,6 @@ const pu=p=>(p.side==="Long"?1:-1)*(p.mark-p.entry)*p.qty-p.fees-p.funding;
 const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(Bybit, read-only, '+f(s.account_reserved)+' committed elsewhere, '+t(s.account_balance_ts)+')</span>'],['Paper equity',f(s.paper_equity)+' USDT <span class=k>('+pc((s.paper_equity/st-1)*100)+' from '+f(st,0)+')</span>'],['Realised P&L <span class=k title="closed trades + fees and funding already paid">ⓘ</span>','<span class='+(s.paper_realized>=0?'ok':'bad')+'>'+sg(s.paper_realized)+' USDT ('+pc(s.paper_realized/st*100)+')</span>'],['Open P&L <span class=k title="open positions marked at the last close">ⓘ</span>','<span class='+(s.paper_open>=0?'ok':'bad')+'>'+sg(s.paper_open)+' USDT ('+pc(s.paper_open/st*100)+')</span>'],['Open positions',s.paper_open_positions],['Dynamic allocation',s.effective_pairs+' pairs <span class=k>'+s.allocation_note+'</span>'],
 ['Closed trades / wins',s.paper_trades+' / '+s.paper_wins],['Max drawdown',f(s.paper_max_drawdown_pct,1)+'%'],
 ['Paper settings',s.report?'<span class='+((s.mode||'').startsWith('TRADING')?'ok':'bad')+'>'+s.mode+'</span>':'…'],
-['Walk-forward check (info)',s.report?'<span class='+(s.validated?'ok':'warn')+'>'+(s.validated?'passed':'not passed')+'</span>':'…'],
 ['Parameter search',s.search_finished_ms?'last finished '+t(s.search_finished_ms)+', next about '+t(s.search_finished_ms+3600000):'first search running'],['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
 ['Tasks',Object.entries(s.tasks||{}).map(([k,v])=>k+(v.running?' ✓':' ✗')).join(' ')]];
 document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+' lowest calm-dip scores (calm and down over 24h), among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
@@ -1043,20 +1047,14 @@ document.getElementById('sig').innerHTML='<tr><th>Symbol<th>Target<th>Held<th>Ca
 tg.map(r=>`<tr><td>${r.symbol}<td class=${r.target||''}>${r.target||'-'}<td class=${r.held||''}>${r.held||'-'}<td>${f(r.signal)}<td>${r.rank}<td>${r.close}<td>${f(r.turnover_24h/1e6,1)}M</tr>`).join('');
 document.getElementById('ev').textContent=(s.events||[]).join('\n');
 document.getElementById('tr').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Exit<th>P&L USDT<th>P&L % (margin)<th>Reason<th>Closed</tr>'+(s.paper_recent_trades||[]).map(x=>`<tr><td>${x.symbol}<td class=${x.side}>${x.side}<td>${x.entry}<td>${x.exit}<td class=${x.pnl>=0?"ok":"bad"}>${sg(x.pnl)}<td class=${x.pnl>=0?"ok":"bad"}>${pc(x.r*100)}<td>${x.reason}<td>${t(x.exit_ts)}</tr>`).join('');
-const r=s.report||{},o=r.oos||{},full=r.full_period||{},eq0=r.start_equity||1,on=(o.end_equity||0)-(o.start_equity||0);
-const desc=p=>p?`${p.signal}${p.signal==='Return'?' over '+p.lookback*15/60+'h':''} ${p.flip?'(follow)':'(contrarian)'}: ${p.long_only?'long the '+p.top+' lowest only':'long the '+p.top+' lowest, short the '+p.top+' highest'}${p.regime==='BtcTrend'?', only while BTC is above its 24h average':''}, rebalance every ${p.hold*15/60}h, ${p.gross_leverage}x, stop ${p.stop_pct==null?'none':p.stop_pct+'%'}`:'none';
-const wn=w=>w.out_of_sample?w.out_of_sample.end_equity-w.out_of_sample.start_equity:null;
-document.getElementById('wf').textContent=r.windows?`walk-forward check (information only; paper trades the best safe settings): ${r.passed?'passed':'not passed'}${r.reasons&&r.reasons.length?'\nwhy: '+r.reasons.join('; '):''}
-settings paper uses: ${desc(s.params)} (${s.choice==='NewBest'?'new best this bar':s.choice==='KeptLastBest'?'kept: nothing scored higher':'none pass the safety rules'})
-best found by this search: ${desc(r.params)}
-
-UNSEEN-DATA TEST (the number that counts): 3 separate 2-day windows the settings never saw, each starting from ${f(eq0,0)} USDT
-  per window: ${r.windows.map((w,i)=>'W'+(i+1)+' '+(wn(w)==null?'no trade':sg(wn(w))+' USDT ('+pc(wn(w)/eq0*100)+')')).join('  |  ')}
-  windows in profit: ${r.positive_windows} of ${r.windows.length}   |   total without the best window: ${sg(r.net_without_best)} USDT
-  total: ${sg(on)} USDT (${pc(on/eq0/r.windows.length*100)} per window on average), ${o.trades} trades, ${o.wins} wins (${f(o.trades?o.wins/o.trades*100:0,0)}%), profit factor ${o.gross_loss>0?f(o.gross_profit/o.gross_loss):'-'}, liquidations ${o.liquidations}, worst drawdown inside a window ${f(o.max_drawdown_pct,1)}%
-
-SELF-CHECK (not a forecast — the settings were chosen on 8 of these 14 days): ${full.trades} trades, ${sg((full.end_equity||0)-(full.start_equity||0))} USDT (${pc(((full.end_equity||0)/(full.start_equity||1)-1)*100)}), max drawdown ${f(full.max_drawdown_pct,1)}% — only used to reject settings that liquidate or fall > 25%
-${r.evaluated} backtests in ${r.elapsed_ms} ms, real closed 15m Bybit bars ${t(r.first_bar_ts)} → ${t(r.last_bar_ts+900000)}`:'waiting for the first closed bar…';
+const r=s.report||{},b=r.metrics||{},bn=(b.end_equity||0)+(b.open_unrealized||0)-(b.start_equity||0);
+const desc=p=>{if(!p)return 'none';const k=p.risk||{},x=[];if(k.take_profit_pct!=null)x.push('take-profit '+k.take_profit_pct+'%');if(k.close_stop_pct!=null)x.push('close-stop '+k.close_stop_pct+'%');if(k.add_pct!=null)x.push('add at -'+k.add_pct+'%');if(k.breaker_pct!=null)x.push('breaker '+k.breaker_pct+'%');if(k.derisk_pct!=null)x.push('half size after -'+k.derisk_pct+'%');if(k.vol_scaled)x.push('volatility-sized');
+return `${p.signal}${p.signal==='Return'?' over '+p.lookback*15/60+'h':''} ${p.flip?'(follow)':'(contrarian)'}: ${p.long_only?'long the '+p.top+' lowest only':'long the '+p.top+' lowest, short the '+p.top+' highest'}${p.regime==='BtcTrend'?', only while BTC is above its 24h average':''}, rebalance every ${p.hold*15/60}h, ${p.gross_leverage}x, stop ${p.stop_pct==null?'none':p.stop_pct+'%'}${x.length?', '+x.join(', '):''}`};
+document.getElementById('wf').textContent=r.combos?`parameter search: ${r.evaluated} of ${r.combos} combinations backtested over the full 14 days (one window, no split) in ${f(r.elapsed_ms/1000,0)} s; ${r.usable} pass the safety rules (no liquidation, drawdown ≤ 25%, at least 8 trades)
+best found: ${desc(r.params)}
+  its 14 days: ${sg(bn)} USDT (${pc(bn/(b.start_equity||1)*100)}), ${b.trades} trades, ${b.wins} wins, profit factor ${b.gross_loss>0?f(b.gross_profit/b.gross_loss):'-'}, max drawdown ${f(b.max_drawdown_pct,1)}%  (chosen on these same 14 days: not a forecast; see the forward test below)
+settings paper uses: ${desc(s.params)} (${s.choice==='NewBest'?'new best':s.choice==='KeptLastBest'?'kept: nothing scored higher':'none pass the safety rules'})
+real closed 15m Bybit bars ${t(r.first_bar_ts)} → ${t(r.last_bar_ts+900000)}`:'waiting for the first search…';
 }catch(e){}}
 // NOTE(agents): Clear old geometry before loading. An unavailable/error result
 // must never leave a previous successful chart visible beside a new status.

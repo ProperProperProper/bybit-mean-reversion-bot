@@ -73,7 +73,7 @@ All numbers come from real Bybit data: closed 15-minute traded and mark-price ca
 ## Tests
 
 ```sh
-cargo test --release --all-targets   # 69 tests, all pass (2026-10-03)
+cargo test --release --all-targets   # 66 tests, all pass (2026-10-03)
 cargo clippy --all-targets -- -D warnings   # clean
 ```
 
@@ -122,7 +122,7 @@ Switching to the best-looking family on these same windows would have been curve
 
 ## Live service
 
-Long-only CalmDip paper bot on the top 20, restarted with a fresh-data reset after every change. Since 2026-10-03 a background search tests 10,000 combinations (about 20 s), starting 60 minutes after the previous search finishes; paper trades the champion settings that pass the two safety rules, and the walk-forward check is shown as information. The dashboard (http://127.0.0.1:8787) shows the current settings, the search times, positions and P&L; this document records no live performance yet.
+Long-only paper bot on the top 20, restarted with a fresh-data reset after every change. Since 2026-10-03 a background search backtests every parameter combination (2,949,120, about 20 minutes) over one 14-day window, never split, starting 60 minutes after the previous search finishes; paper trades the champion settings that pass the two safety rules. The dashboard (http://127.0.0.1:8787) shows the settings in use, the search, positions, P&L and the chronological forward-test chart; this document records no live performance yet. The split walk-forward used for the results above was removed on 2026-10-03 (user rule).
 
 ## Reproduce
 

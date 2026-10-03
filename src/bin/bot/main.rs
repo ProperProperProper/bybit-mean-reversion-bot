@@ -1,7 +1,7 @@
 //! Bybit Mean Reversion Bot: long-only "calm dip" strategy on Bybit USDT perps
 //! (paper + signals only; never places orders).
 //!
-//!   bot backtest     sync real data and print the live strategy's 14-day walk-forward
+//!   bot backtest     sync real data and print the live parameter search (one 14-day window)
 //!                    (same grid, gates, real Bybit rules and real account balance as `serve`)
 //!   bot serve        paper-trading service + dashboard on 127.0.0.1:8787
 
@@ -58,20 +58,23 @@ async fn backtest() -> Result<()> {
     let t1 = Instant::now();
     let report = tokio::task::spawn_blocking(move || {
         let sc = scores::compute(&market, walkforward::UNIVERSE);
-        walkforward::run_xs_with(
+        walkforward::search_full(
             &market,
             &sc,
             balance,
-            Instant::now() + Duration::from_secs(1800),
-            &walkforward::live_grid(),
+            Instant::now() + Duration::from_secs(3600),
+            walkforward::LIVE_COMBOS,
+            walkforward::live_combo,
         )
     })
     .await??;
     println!("{}", serde_json::to_string_pretty(&report)?);
     eprintln!(
-        "walk-forward {:.1}s, {} configs evaluated",
+        "search {:.1}s: {} of {} combinations backtested over 14 days, {} usable",
         t1.elapsed().as_secs_f64(),
-        report.evaluated
+        report.evaluated,
+        report.combos,
+        report.usable
     );
     Ok(())
 }

@@ -8,7 +8,8 @@
 //! search_task: every parameter (walkforward::live_combo) over one 14-day
 //! window, champion/challenger; next search 60 min after the last finished.
 //! Console: 127.0.0.1:8787 (`/`, `/api/status`, `/api/signals`, `/api/research`),
-//! polled by the page (no WebSocket).
+//! polled by the page. price_task: live mark prices for held symbols over
+//! Bybit's public WebSocket (stops and the drawdown stop, wick-safe).
 
 use anyhow::Result;
 use bybit_mean_reversion_bot::engine::scores;
@@ -69,6 +70,9 @@ pub struct Status {
     pub choice: Option<walkforward::Choice>,
     /// When the latest parameter search finished (ms; 0 = none yet).
     pub search_finished_ms: i64,
+    /// Live mark-price monitor: held symbols subscribed, and the newest mark update (ms).
+    pub live_symbols: usize,
+    pub live_last_ms: i64,
     /// TRADING (new best / kept last best) or NO SAFE SETTINGS.
     pub mode: String,
     pub paper_equity: f64,
@@ -362,6 +366,11 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
     health.spawn("bar_task", Duration::from_secs(1200), move |hb| {
         let a = a.clone();
         async move { bar_task(a, hb).await }
+    });
+    let a = app.clone();
+    health.spawn("price_task", Duration::from_secs(120), move |hb| {
+        let a = a.clone();
+        async move { price_task(a, hb).await }
     });
     let a = app.clone();
     // Stall limit above SEARCH_DEADLINE: the task cannot beat while a search runs.
@@ -805,7 +814,14 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                         .into();
             }
         }
+        let stopped = paper.as_ref().is_some_and(|ps| ps.portfolio.stopped_out);
         s.mode = match choice {
+            _ if stopped && s.paper_open_positions > 0 => {
+                "STOPPED OUT (25% drawdown, closing positions)"
+            }
+            _ if stopped => {
+                "STOPPED OUT (25% drawdown, no new positions until the next fresh reset)"
+            }
             None => "SEARCHING (first search running)",
             Some(walkforward::Choice::NewBest) => "TRADING (new best settings)",
             Some(walkforward::Choice::KeptLastBest) => "TRADING (kept last best settings)",
@@ -837,6 +853,102 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         drop(s);
         drop(paper);
         app.event("INFO", summary);
+    }
+}
+
+// NOTE(agents): User request (2026-10-03): paper watches prices LIVE so stops happen when they
+//               should, wick-safe. Bybit's public WebSocket ticker stream gives the MARK price
+//               for every held symbol; `XsPortfolio::live_check` locks in exits (position stops,
+//               the 25% drawdown stop) at the live mark, and the next bar books them after its
+//               funding. If the socket drops, the supervisor reconnects and the candle-based
+//               checks (also mark-triggered) remain the fallback. Never trigger on last-trade
+//               prices (wicks).
+const WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
+/// Marks older than this are not used for live decisions.
+const MARK_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Live mark-price monitor for held symbols over Bybit's public WebSocket.
+async fn price_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut ws, _) = tokio_tungstenite::connect_async(WS_URL).await?;
+    let mut subscribed = std::collections::BTreeSet::<String>::new();
+    let mut marks: std::collections::HashMap<String, (f64, Instant)> = Default::default();
+    let mut ping = tokio::time::interval(Duration::from_secs(20));
+    let mut check = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        hb.beat();
+        tokio::select! {
+            _ = ping.tick() => ws.send(Message::text(r#"{"op":"ping"}"#)).await?,
+            _ = check.tick() => {
+                let held: std::collections::BTreeSet<String> = app
+                    .paper
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|ps| ps.portfolio.positions.iter().map(|p| p.symbol.clone()).collect())
+                    .unwrap_or_default();
+                let add: Vec<String> = held.difference(&subscribed).map(|s| format!("tickers.{s}")).collect();
+                let drop: Vec<String> = subscribed.difference(&held).cloned().collect();
+                if !add.is_empty() {
+                    ws.send(Message::text(serde_json::json!({"op":"subscribe","args":add}).to_string())).await?;
+                }
+                if !drop.is_empty() {
+                    let args: Vec<String> = drop.iter().map(|s| format!("tickers.{s}")).collect();
+                    ws.send(Message::text(serde_json::json!({"op":"unsubscribe","args":args}).to_string())).await?;
+                    for s in &drop {
+                        marks.remove(s);
+                    }
+                }
+                subscribed = held;
+                let fresh: std::collections::HashMap<String, f64> = marks
+                    .iter()
+                    .filter(|(_, (_, at))| at.elapsed() <= MARK_MAX_AGE)
+                    .map(|(s, (m, _))| (s.clone(), *m))
+                    .collect();
+                {
+                    let mut st = app.status.write().unwrap_or_else(|e| e.into_inner());
+                    st.live_symbols = subscribed.len();
+                }
+                if fresh.is_empty() {
+                    continue;
+                }
+                let lines = {
+                    let mut guard = app.paper.write().unwrap_or_else(|e| e.into_inner());
+                    let Some(ps) = guard.as_mut() else { continue };
+                    let lines = ps.portfolio.live_check(&fresh, chrono::Utc::now().timestamp_millis());
+                    if !lines.is_empty() {
+                        persist_paper(&app.dir.join(PAPER_FILE), ps)?;
+                    }
+                    lines
+                };
+                for l in lines {
+                    app.event("WARN", format!("LIVE {l}"));
+                }
+            }
+            msg = ws.next() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    let (Some(topic), Some(mark)) = (
+                        v["topic"].as_str(),
+                        v["data"]["markPrice"].as_str().and_then(|x| x.parse::<f64>().ok()),
+                    ) else {
+                        continue;
+                    };
+                    if let Some(symbol) = topic.strip_prefix("tickers.") {
+                        if mark.is_finite() && mark > 0.0 {
+                            marks.insert(symbol.to_string(), (mark, Instant::now()));
+                            let mut st = app.status.write().unwrap_or_else(|e| e.into_inner());
+                            st.live_last_ms = chrono::Utc::now().timestamp_millis();
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => ws.send(Message::Pong(payload)).await?,
+                Some(Ok(Message::Close(_))) | None => anyhow::bail!("Bybit WebSocket closed"),
+                Some(Err(e)) => return Err(e.into()),
+                Some(Ok(_)) => {}
+            },
+        }
     }
 }
 
@@ -1037,7 +1149,7 @@ const pu=p=>(p.side==="Long"?1:-1)*(p.mark-p.entry)*p.qty-p.fees-p.funding;
 const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(Bybit, read-only, '+f(s.account_reserved)+' committed elsewhere, '+t(s.account_balance_ts)+')</span>'],['Paper equity',f(s.paper_equity)+' USDT <span class=k>('+pc((s.paper_equity/st-1)*100)+' from '+f(st,0)+')</span>'],['Realised P&L <span class=k title="closed trades + fees and funding already paid">ⓘ</span>','<span class='+(s.paper_realized>=0?'ok':'bad')+'>'+sg(s.paper_realized)+' USDT ('+pc(s.paper_realized/st*100)+')</span>'],['Open P&L <span class=k title="open positions marked at the last close">ⓘ</span>','<span class='+(s.paper_open>=0?'ok':'bad')+'>'+sg(s.paper_open)+' USDT ('+pc(s.paper_open/st*100)+')</span>'],['Open positions',s.paper_open_positions],['Dynamic allocation',s.effective_pairs+' pairs <span class=k>'+s.allocation_note+'</span>'],
 ['Closed trades / wins',s.paper_trades+' / '+s.paper_wins],['Max drawdown',f(s.paper_max_drawdown_pct,1)+'%'],
 ['Paper settings',s.report?'<span class='+((s.mode||'').startsWith('TRADING')?'ok':'bad')+'>'+s.mode+'</span>':'…'],
-['Parameter search',s.search_finished_ms?'last finished '+t(s.search_finished_ms)+', next about '+t(s.search_finished_ms+3600000):'first search running'],['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
+['Live price monitor',s.live_symbols?s.live_symbols+' held symbols on Bybit WebSocket (mark price), last update '+t(s.live_last_ms):'idle (no positions held)'],['Parameter search',s.search_finished_ms?'last finished '+t(s.search_finished_ms)+', next about '+t(s.search_finished_ms+3600000):'first search running'],['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
 ['Tasks',Object.entries(s.tasks||{}).map(([k,v])=>k+(v.running?' ✓':' ✗')).join(' ')]];
 document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+(s.params?' '+(s.params.flip?'highest':'lowest')+' '+s.params.signal+' values':' coins ranked first')+', among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
 document.getElementById('cards').innerHTML=cards.map(c=>`<div class=card><span class=k>${c[0]}</span><b>${c[1]}</b></div>`).join('');
@@ -1050,7 +1162,7 @@ tg.map(r=>`<tr><td>${r.symbol}<td class=${r.target||''}>${r.target||'-'}<td clas
 document.getElementById('ev').textContent=(s.events||[]).join('\n');
 document.getElementById('tr').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Exit<th>P&L USDT<th>P&L % (margin)<th>Reason<th>Closed</tr>'+(s.paper_recent_trades||[]).map(x=>`<tr><td>${x.symbol}<td class=${x.side}>${x.side}<td>${x.entry}<td>${x.exit}<td class=${x.pnl>=0?"ok":"bad"}>${sg(x.pnl)}<td class=${x.pnl>=0?"ok":"bad"}>${pc(x.r*100)}<td>${x.reason}<td>${t(x.exit_ts)}</tr>`).join('');
 const r=s.report||{},b=r.metrics||{},bn=(b.end_equity||0)+(b.open_unrealized||0)-(b.start_equity||0);
-const desc=p=>{if(!p)return 'none';const k=p.risk||{},x=[];if(k.take_profit_pct!=null)x.push('take-profit '+k.take_profit_pct+'%');if(k.close_stop_pct!=null)x.push('close-stop '+k.close_stop_pct+'%');if(k.add_pct!=null)x.push('add at -'+k.add_pct+'%');if(k.breaker_pct!=null)x.push('breaker '+k.breaker_pct+'%');if(k.derisk_pct!=null)x.push('half size after -'+k.derisk_pct+'%');if(k.vol_scaled)x.push('volatility-sized');
+const desc=p=>{if(!p)return 'none';const k=p.risk||{},x=[];if(k.take_profit_pct!=null)x.push('take-profit '+k.take_profit_pct+'%');if(k.close_stop_pct!=null)x.push('close-stop '+k.close_stop_pct+'%');if(k.add_pct!=null)x.push('add at -'+k.add_pct+'%');if(k.breaker_pct!=null)x.push('breaker '+k.breaker_pct+'%');if(k.vol_scaled)x.push('volatility-sized');
 return `${p.signal}${p.signal==='Return'?' over '+p.lookback*15/60+'h':''} ${p.flip?'(follow)':'(contrarian)'}: ${p.long_only?'long the '+p.top+' lowest only':'long the '+p.top+' lowest, short the '+p.top+' highest'}${p.regime==='BtcTrend'?', only while BTC is above its 24h average':''}, rebalance every ${p.hold*15/60}h, ${p.gross_leverage}x, stop ${p.stop_pct==null?'none':p.stop_pct+'%'}${x.length?', '+x.join(', '):''}`};
 document.getElementById('wf').textContent=r.combos?`parameter search: ${r.evaluated} of ${r.combos} combinations backtested over the full 14 days (one window, no split) in ${f(r.elapsed_ms/1000,0)} s; ${r.usable} pass the safety rules (no liquidation, drawdown ≤ 25%, at least 8 trades)
 best found: ${desc(r.params)}

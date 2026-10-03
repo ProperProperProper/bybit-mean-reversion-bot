@@ -1,6 +1,6 @@
 # `src/engine/data.rs`: Bybit data and the SQLite cache
 
-Everything the bot knows about the market comes through this file, over REST only. Public endpoints supply instruments, tickers, closed traded and mark-price klines, settled funding, risk limits and order books. Two signed, read-only endpoints supply the account's fee rates and wallet. Every number is parsed strictly: a missing or garbled field drops that row or fails the call, and is never replaced by a default.
+Everything the bot knows about the market comes through this file, over REST (the live mark-price WebSocket monitor lives in the service, [bot.md](bot.md)). Public endpoints supply instruments, tickers, closed traded and mark-price klines, settled funding, risk limits and order books. Two signed, read-only endpoints supply the account's fee rates and wallet. Every number is parsed strictly: a missing or garbled field drops that row or fails the call, and is never replaced by a default.
 
 ## Constants
 

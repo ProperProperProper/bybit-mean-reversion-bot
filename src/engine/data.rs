@@ -1,4 +1,4 @@
-//! Bybit REST data (REST polling only, no WebSockets). Public: USDT linear
+//! Bybit REST data (the live mark-price WebSocket is in the bot service). Public: USDT linear
 //! perpetual instruments, CLOSED 15m klines, settled funding, risk limits and
 //! order books. Signed and read-only: the account's fee rates and wallet balance.
 //! Every number is parsed strictly: a missing or garbled field drops that row

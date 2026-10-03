@@ -23,7 +23,7 @@ The best usable combination is picked by `objective`: `return % − 0.5 × max d
 | `CANDIDATES` | `UNIVERSE` (20) | Coins measured for rules each refresh; a coin without complete rules shrinks the universe |
 | `MAX_DRAWDOWN_PCT` | 25 | Safety rule: maximum drawdown over the 14 days |
 | `MIN_TRADES` | 8 | Usable settings must actually trade |
-| `LIVE_COMBOS` | 2,949,120 | Size of the live grid |
+| `LIVE_COMBOS` | 1,474,560 | Size of the live grid |
 
 ## The live grid: every parameter (`LIVE_COMBOS`, `live_combo(i)`)
 
@@ -35,16 +35,15 @@ User rule (2026-10-03): **test all**. Every strategy parameter varies. Long only
 | Hold | 8, 16, 24, 32, 64, 96, 144, 192 bars (2h–48h) |
 | Coins | 1–5 |
 | Leverage | 1×, 2×, 3×, 5× |
-| Intrabar stop | none, 5, 10, 20% |
+| Stop (mark-triggered) | none, 5, 10, 20% |
 | Take-profit | none, 5, 10, 40% |
 | Close-based stop | none, 10% |
 | Averaging down (`add_pct`) | none, 10% |
 | Drawdown breaker | none, 15% |
-| Half size after drawdown | none, 10% |
 | Volatility sizing | off, on |
 | BTC trend filter | off, on |
 
-18 × 8 × 5 × 4 × 4 × 4 × 2⁶ = **2,949,120** combinations. A full 14-day backtest costs about 0.4 ms on 20 coins, so one search takes about 20 minutes under the CPU governor.
+18 × 8 × 5 × 4 × 4 × 4 × 2⁵ = **1,474,560** combinations (there is no half-size option: the user forbids halving the budget). A full 14-day backtest costs about 0.4–0.5 ms on 20 coins, so one search takes about 12 minutes under the CPU governor.
 
 `live_combo(i)` decodes combination `i` in mixed radix, so the grid is never held in memory. A test checks the count, that combinations are distinct, and that every listed value occurs.
 

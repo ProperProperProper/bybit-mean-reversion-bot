@@ -23,7 +23,8 @@ pub const UNIVERSE: usize = 20;
 /// Measure only the selected top 20. Missing rules reduce the count; do not
 /// scan additional candidates beyond the user's cap.
 pub const CANDIDATES: usize = UNIVERSE;
-pub const MAX_DRAWDOWN_PCT: f64 = 25.0;
+/// Safety rule: the same value as the live drawdown stop.
+pub const MAX_DRAWDOWN_PCT: f64 = xs::DRAWDOWN_STOP_PCT;
 
 fn objective(m: &Metrics) -> f64 {
     m.return_pct() - 0.5 * m.max_drawdown_pct
@@ -35,7 +36,7 @@ mod tests {
 
     #[test]
     fn live_grid_covers_every_parameter_value_once() {
-        assert_eq!(LIVE_COMBOS, 2_949_120);
+        assert_eq!(LIVE_COMBOS, 1_474_560);
         // Every index decodes to a distinct combination (checked on a dense
         // stride plus both ends); every listed value of every parameter occurs.
         let picks: Vec<usize> = (0..LIVE_COMBOS)
@@ -108,8 +109,8 @@ use super::xs::{self, Regime, Signal, XsParams};
 // NOTE(agents): User rule (2026-10-03): "test all". The live search varies EVERY strategy
 //               parameter: all 8 signals in both directions (Return at two lookbacks), hold,
 //               basket size, leverage, intrabar stop, take-profit, close-based stop, averaging
-//               down, drawdown breaker, half-size after drawdown, volatility sizing and the BTC
-//               filter. Value lists are sized so one search takes ~20 min (about 0.4 ms per
+//               down, drawdown breaker, volatility sizing and the BTC filter. (No half-size rule:
+//               the user forbids halving the budget.) Value lists are sized so one search takes ~20 min (about 0.4 ms per
 //               14-day backtest); adding values multiplies the time. Long only is a user rule.
 const HOLDS: [usize; 8] = [8, 16, 24, 32, 64, 96, 144, 192];
 const TOPS: [usize; 5] = [1, 2, 3, 4, 5];
@@ -119,7 +120,6 @@ const TAKE_PROFITS: [Option<f64>; 4] = [None, Some(5.0), Some(10.0), Some(40.0)]
 const CLOSE_STOPS: [Option<f64>; 2] = [None, Some(10.0)];
 const ADDS: [Option<f64>; 2] = [None, Some(10.0)];
 const BREAKERS: [Option<f64>; 2] = [None, Some(15.0)];
-const DERISKS: [Option<f64>; 2] = [None, Some(10.0)];
 const VOL_SCALED: [bool; 2] = [false, true];
 const REGIMES: [Regime; 2] = [Regime::Off, Regime::BtcTrend];
 
@@ -136,7 +136,7 @@ fn signal_variants() -> Vec<(Signal, usize, bool)> {
         .collect()
 }
 
-/// Combinations in the live grid: 18 × 8 × 5 × 4 × 4 × 4 × 2⁶ = 2,949,120.
+/// Combinations in the live grid: 18 × 8 × 5 × 4 × 4 × 4 × 2⁵ = 1,474,560.
 pub const LIVE_COMBOS: usize = 18
     * HOLDS.len()
     * TOPS.len()
@@ -146,7 +146,6 @@ pub const LIVE_COMBOS: usize = 18
     * CLOSE_STOPS.len()
     * ADDS.len()
     * BREAKERS.len()
-    * DERISKS.len()
     * VOL_SCALED.len()
     * REGIMES.len();
 
@@ -161,7 +160,6 @@ pub fn live_combo(i: usize) -> XsParams {
     };
     let regime = REGIMES[take(REGIMES.len())];
     let vol_scaled = VOL_SCALED[take(VOL_SCALED.len())];
-    let derisk_pct = DERISKS[take(DERISKS.len())];
     let breaker_pct = BREAKERS[take(BREAKERS.len())];
     let add_pct = ADDS[take(ADDS.len())];
     let close_stop_pct = CLOSE_STOPS[take(CLOSE_STOPS.len())];
@@ -185,7 +183,6 @@ pub fn live_combo(i: usize) -> XsParams {
             add_pct,
             breaker_pct,
             vol_scaled,
-            derisk_pct,
             short_stop_pct: None,
         },
         long_only: true,

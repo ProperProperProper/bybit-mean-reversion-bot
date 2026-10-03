@@ -51,9 +51,13 @@ The console chart: settings chosen by the live full-window search on research wi
 
 Any error ends the run and the supervisor restarts it.
 
+### `price_task`: live mark prices (WebSocket)
+
+Subscribes Bybit's public `tickers.<SYMBOL>` stream (`wss://stream.bybit.com/v5/public/linear`) for every held symbol, pings every 20 s, and once a second calls `XsPortfolio::live_check` with marks no older than 30 s. A position whose stop the **mark** reaches, or every position when marked equity is 25% below its peak, gets an exit locked in at that mark price and time (saved immediately); the next bar books it after its funding. Stops never trigger on last-trade wicks. If the socket closes the supervisor reconnects; the candle checks (also mark-triggered) remain the fallback.
+
 ### `search_task`: the parameter search
 
-Backtests every live-grid combination (`walkforward::LIVE_COMBOS`, 2,949,120, about 20 minutes on 20 coins) over the newest 14-day market with `walkforward::search_full`, then `walkforward::choose_live` against the settings in use, and stores the result for `bar_task`. After its first search it builds the dashboard's forward-test chart (choose on research window 2 with the same full search, trade window 3), so the two searches don't share the CPU budget. The next search starts `SEARCH_PAUSE` (60 min) after this one **finishes**. A failed or timed-out search keeps the previous result and retries after `SEARCH_RETRY`. Its stall limit is `SEARCH_DEADLINE` + 10 min because the task cannot send heartbeats while the search runs.
+Backtests every live-grid combination (`walkforward::LIVE_COMBOS`, 1,474,560, about 12 minutes on 20 coins) over the newest 14-day market with `walkforward::search_full`, then `walkforward::choose_live` against the settings in use, and stores the result for `bar_task`. After its first search it builds the dashboard's forward-test chart (choose on research window 2 with the same full search, trade window 3), so the two searches don't share the CPU budget. The next search starts `SEARCH_PAUSE` (60 min) after this one **finishes**. A failed or timed-out search keeps the previous result and retries after `SEARCH_RETRY`. Its stall limit is `SEARCH_DEADLINE` + 10 min because the task cannot send heartbeats while the search runs.
 
 ### `console`
 

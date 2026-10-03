@@ -34,7 +34,7 @@ A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned re
 | `hold` | Bars between rebalances (16 = 4h, 32 = 8h, 96 = 24h), aligned to UTC timestamps |
 | `top` | Maximum coins per side; smaller balances use fewer (see `funded_targets`) |
 | `gross_leverage` | Leverage of each position |
-| `stop_pct` | Optional intrabar stop (% against entry) |
+| `stop_pct` | Optional stop (% against entry), triggered by the **mark price** (wick-safe), live via `live_check` and on candle extremes as the fallback |
 | `risk` | Drawdown rules (`Risk`), all off by default |
 | `long_only` | Hold only the long side (`slots()` = `top` instead of `2 × top`); the neutrality check is skipped, all legs must still fill |
 | `regime` | Entry filter (`Regime`) |
@@ -55,7 +55,6 @@ Each rule is decided on a 15-minute **close** and executed at the **next open**.
 | `add_pct` | Add the same size once when a close is X% against (slots keep room for it) |
 | `breaker_pct` | Close everything when marked equity is X% below the equity at the last rebalance |
 | `vol_scaled` | Size by inverse recent volatility, normalised **within each side** so both sides keep equal notional |
-| `derisk_pct` | Trade at half size while equity is X% or more below its peak |
 
 ## `struct XsPosition`
 
@@ -99,9 +98,11 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 2. Funding stamped at this open is charged; then any position whose mark open is through its liquidation level is liquidated, **before** any queued action.
 3. Queued actions: breaker flatten, then per-position stop / take-profit / rebalance exit; an add only when no rebalance coincides and entries are allowed.
 4. Rebalance (if decided earlier and due): waits a bar if any target lacks data; otherwise closes every position, then opens all legs with the fixed slot budget on a copy. The copy replaces the account only if **every** leg filled and (unless long only) the sides are within `NEUTRAL_TOLERANCE`; otherwise `rejected_rebalances` += 1. No entries while the free balance is below the minimum.
-5. Inside the bar: intrabar funding is refused (it needs finer mark data); mark-price liquidation (open or adverse extreme) first, then the traded-price stop; then the close-based rules queue the next action.
+5. Inside the bar: intrabar funding is refused (it needs finer mark data); mark-price liquidation (open or adverse extreme) first, then the stop, also triggered by the mark (wick-safe), filled at the stop level or the traded open on a gap; then the close-based rules (on the mark close) queue the next action.
 6. Funding stamped at this bar's close is charged at the next bar's mark open. On the newest loaded bar it waits for that bar.
-7. Breaker check, then `decide_close`, then peak and drawdown.
+7. Breaker check, then the **drawdown stop** (marked equity `DRAWDOWN_STOP_PCT` = 25% below its peak: close everything at the next open, `stopped_out`, no new positions or adds for the rest of the run), then `decide_close`, then peak and drawdown.
+
+**`live_check(marks, now)`** is called by the live WebSocket monitor with fresh mark prices: it locks in `live_exit` (time, mark, reason) for every position whose stop the mark has reached, and for every position when marked equity is 25% below its peak (`stopped_out`). Step 2½: right after the opening funding and gap liquidation, each bar books the live exits that fall inside it, at the recorded mark (with measured book cost) and time.
 
 **`decide_close`** fixes targets, parameters and slot budget at aligned closes. **`install_entry_gate`** cancels queued entries (and adds, when disabled) when settings or eligibility change. **`defer_new_decisions`** makes a live decision fill no earlier than the open after it was ready. **`validate_state`** rejects corrupt persisted state. **`close_all`** closes everything at the last traded close with book cost and fee.
 

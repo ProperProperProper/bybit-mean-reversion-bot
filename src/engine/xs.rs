@@ -22,6 +22,14 @@ use std::collections::BTreeMap;
 pub const MIN_ENTRY_BALANCE: f64 = 5.0;
 /// Long and short gross notional may differ by at most this fraction.
 pub const NEUTRAL_TOLERANCE: f64 = 0.02;
+// NOTE(agents): User rule (2026-10-03): "if drawdown goes beyond 25% then it should stop out".
+//               At every 15m close, marked equity >= this % below its peak closes everything at
+//               the next open and blocks all entries and adds for the rest of the run (live: until
+//               the next fresh reset). Close-based like the other rules, so a crash inside one
+//               candle can overshoot before the next open. The search's safety rule uses the
+//               same value (walkforward::MAX_DRAWDOWN_PCT).
+/// Account drawdown stop, % below the peak of marked equity.
+pub const DRAWDOWN_STOP_PCT: f64 = 25.0;
 // NOTE(agents): Slots are sized at the decision close from marked equity; closing the old positions
 //               costs fees and book cost before the new ones fill. Without this headroom the last
 //               leg didn't fit and the whole rebalance was rejected (919 times in 192 real-data
@@ -160,9 +168,6 @@ pub struct Risk {
     /// Size positions inversely to their recent volatility (same total size).
     #[serde(default)]
     pub vol_scaled: bool,
-    /// Trade at half size while equity is this % or more below its peak.
-    #[serde(default)]
-    pub derisk_pct: Option<f64>,
 }
 
 /// Action decided at a close, executed at the next open.
@@ -201,6 +206,10 @@ pub struct XsPosition {
     pub added: bool,
     /// The account's Bybit taker fee for this symbol at entry.
     pub fee_rate: f64,
+    /// An exit the live mark-price monitor locked in mid-bar: (time ms, mark
+    /// price, reason). Booked when that bar is processed, after its funding.
+    #[serde(default)]
+    pub live_exit: Option<(i64, f64, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +260,9 @@ pub struct XsPortfolio {
     /// Breaker tripped at a close: close everything at the next open.
     #[serde(default)]
     flatten_next: bool,
+    /// The drawdown stop fired: everything is closed and nothing new opens.
+    #[serde(default)]
+    pub stopped_out: bool,
 }
 
 fn one() -> f64 {
@@ -395,6 +407,9 @@ fn ranked_targets(
 // NOTE(agents): Balance-aware sizing for every account size: tries the configured basket, then
 //               smaller ones, until each slot passes the real lot, minimum, depth and leverage
 //               checks. Returns the slot budget so execution reuses it exactly.
+//               User rule (2026-10-03): NEVER halve the budget. Every slot gets the full share
+//               of the free balance: no half size after drawdowns, no half slot reserved for an
+//               average-down add (an add only fills from free balance that happens to remain).
 /// Reduce the basket until the balance can fund the contracts' actual lot rules.
 fn funded_targets(
     m: &Market,
@@ -403,16 +418,14 @@ fn funded_targets(
     p: &XsParams,
     equity: f64,
     cost_mult: f64,
-    scale: f64,
 ) -> (BTreeMap<usize, Side>, usize, f64) {
     if equity < MIN_ENTRY_BALANCE {
         return (BTreeMap::new(), 0, 0.0);
     }
-    let adds = if p.risk.add_pct.is_some() { 2.0 } else { 1.0 };
     for top in (1..=p.top.min(m.symbols.len() / 2)).rev() {
         let mut adaptive = p.clone();
         adaptive.top = top;
-        let budget = equity * scale * SLOT_HEADROOM / adaptive.slots() as f64 / adds;
+        let budget = equity * SLOT_HEADROOM / adaptive.slots() as f64;
         let target = ranked_targets(m, scores, t, &adaptive, Some((budget, cost_mult)));
         if target.len() == adaptive.slots() {
             return (target, top, budget);
@@ -444,6 +457,7 @@ impl XsPortfolio {
             entries_allowed: true,
             rebalance_equity: equity,
             flatten_next: false,
+            stopped_out: false,
         }
     }
 
@@ -591,6 +605,61 @@ impl XsPortfolio {
         }
     }
 
+    /// The live monitor's check on fresh mark prices (`marks`: symbol -> mark).
+    /// Locks in an exit for every position whose stop the mark has reached and,
+    /// if marked equity is `DRAWDOWN_STOP_PCT` below its peak, stops out: every
+    /// position gets an exit and nothing new opens. Returns what it did.
+    pub fn live_check(
+        &mut self,
+        marks: &std::collections::HashMap<String, f64>,
+        now_ms: i64,
+    ) -> Vec<String> {
+        let mut done = Vec::new();
+        for pos in self.positions.iter_mut().filter(|p| p.live_exit.is_none()) {
+            let (Some(&mark), Some(stop)) = (marks.get(&pos.symbol), pos.stop) else {
+                continue;
+            };
+            if pos.side.sign() * (mark - stop) <= 0.0 {
+                pos.live_exit = Some((now_ms, mark, "Stop (live mark)".into()));
+                done.push(format!("{} stop hit at mark {mark}", pos.symbol));
+            }
+        }
+        let marked = self.equity
+            + self
+                .positions
+                .iter()
+                .map(|p| {
+                    let price = p
+                        .live_exit
+                        .as_ref()
+                        .map(|x| x.1)
+                        .or_else(|| marks.get(&p.symbol).copied())
+                        .unwrap_or(p.mark);
+                    p.side.sign() * (price - p.entry) * p.qty
+                })
+                .sum::<f64>();
+        let peak = self.peak.max(marked);
+        if !self.stopped_out
+            && !self.positions.is_empty()
+            && peak > 0.0
+            && (peak - marked) / peak * 100.0 >= DRAWDOWN_STOP_PCT
+        {
+            self.stopped_out = true;
+            self.pending_targets = None;
+            self.pending_params = None;
+            self.pending_slot = 0.0;
+            for pos in self.positions.iter_mut().filter(|p| p.live_exit.is_none()) {
+                let price = marks.get(&pos.symbol).copied().unwrap_or(pos.mark);
+                pos.live_exit = Some((now_ms, price, "Drawdown stop (live mark)".into()));
+            }
+            done.push(format!(
+                "drawdown stop: marked equity {marked:.2} is {:.1}% below its peak {peak:.2}; closing everything",
+                (peak - marked) / peak * 100.0
+            ));
+        }
+        done
+    }
+
     /// Cancel queued entries when the report changes; retain risk exits.
     pub fn install_entry_gate(&mut self, allowed: bool) {
         self.entries_allowed = allowed;
@@ -675,6 +744,7 @@ impl XsPortfolio {
             action_not_before: 0,
             added: false,
             fee_rate: r.taker_fee,
+            live_exit: None,
         });
     }
 
@@ -707,7 +777,8 @@ impl XsPortfolio {
             return;
         };
         let fee = q * px * r.taker_fee * self.cost_mult;
-        if self.available() < MIN_ENTRY_BALANCE
+        if self.stopped_out
+            || self.available() < MIN_ENTRY_BALANCE
             || q * px / self.positions[i].leverage + fee > self.available() + 1e-9
         {
             return; // Bybit would reject: not enough available balance
@@ -772,6 +843,21 @@ impl XsPortfolio {
                 i += 1;
             }
         }
+        // NOTE(agents): Live exits (locked in by the WebSocket monitor, `live_check`) are booked
+        //               here: after this bar's opening funding and gap liquidation, before any
+        //               queued action, at the recorded mark price and time. Booking them here
+        //               keeps funding and the settlement ledger exact.
+        let mut i = 0;
+        while i < self.positions.len() {
+            match self.positions[i].live_exit.clone() {
+                Some((at, price, reason)) if at < ts + BAR_MS => {
+                    if !self.close_market(m, i, at.max(ts), price, &reason) {
+                        return;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
         let rebalancing = self.pending_targets.is_some() && ts >= self.pending_not_before;
         // 0. Actions decided at the previous close execute at this open. An add
         //    that coincides with a rebalance is skipped: the rebalance decides.
@@ -782,7 +868,12 @@ impl XsPortfolio {
                 let sym = self.positions[i].sym;
                 match m.bars[sym][t] {
                     Some(b) => {
-                        if !self.close_market(m, i, ts, b.open, "Breaker") {
+                        let reason = if self.stopped_out {
+                            "Drawdown stop"
+                        } else {
+                            "Breaker"
+                        };
+                        if !self.close_market(m, i, ts, b.open, reason) {
                             return;
                         }
                     }
@@ -888,6 +979,7 @@ impl XsPortfolio {
                 };
                 let means = [side_mean(Side::Long), side_mean(Side::Short)];
                 let can_enter = self.entries_allowed
+                    && !self.stopped_out
                     && !self.flatten_next
                     && self.positions.is_empty()
                     && !target.is_empty();
@@ -955,7 +1047,9 @@ impl XsPortfolio {
             };
             let pos = &self.positions[i];
             let s = side.sign();
-            let adverse = if s > 0.0 { b.low } else { b.high };
+            // NOTE(agents): Wick-safe (user rule, 2026-10-03): stops TRIGGER on Bybit's mark
+            //               price, never on last-trade wicks; fills use traded prices and the
+            //               measured book cost. Liquidation also uses the mark, as on Bybit.
             let mark_adverse = if s > 0.0 { mark.low } else { mark.high };
             let through = |level: f64, price: f64| s * (price - level) <= 0.0;
             // Mark liquidation is checked first when both mark liquidation and
@@ -965,13 +1059,13 @@ impl XsPortfolio {
                 continue;
             }
             if let Some(st) = pos.stop {
-                if through(st, b.open) {
+                if through(st, mark.open) {
                     if !self.close_market(m, i, ts, b.open, "Stop (gap)") {
                         return;
                     }
                     continue;
                 }
-                if through(st, adverse) {
+                if through(st, mark_adverse) {
                     if !self.close_market(m, i, ts, st, "Stop") {
                         return;
                     }
@@ -981,7 +1075,7 @@ impl XsPortfolio {
             let r = p.risk;
             let pos = &mut self.positions[i];
             pos.mark = mark.close;
-            let against = -s * (b.close - pos.entry) / pos.entry * 100.0;
+            let against = -s * (mark.close - pos.entry) / pos.entry * 100.0;
             let pending_exit = matches!(
                 pos.next_action,
                 Some(NextAction::Stop | NextAction::TakeProfit | NextAction::Rebalance)
@@ -1042,6 +1136,21 @@ impl XsPortfolio {
                 self.flatten_next = true;
             }
         }
+        let peak = self.peak.max(marked);
+        if !self.stopped_out && peak > 0.0 && (peak - marked) / peak * 100.0 >= DRAWDOWN_STOP_PCT {
+            self.stopped_out = true;
+            self.pending_targets = None;
+            self.pending_params = None;
+            self.pending_slot = 0.0;
+            for pos in &mut self.positions {
+                if pos.next_action == Some(NextAction::Add) {
+                    pos.next_action = None;
+                }
+            }
+            if !self.positions.is_empty() {
+                self.flatten_next = true;
+            }
+        }
         // 3. Rebalance decision at aligned closes.
         self.decide_close(m, scores, t, p);
         self.peak = self.peak.max(marked);
@@ -1065,17 +1174,9 @@ impl XsPortfolio {
             self.pending_not_before = 0;
             let marked = self.equity + self.unrealized();
             let usable = marked - self.reserved;
-            let scale =
-                if p.risk.derisk_pct.is_some_and(|d| {
-                    self.peak > 0.0 && (self.peak - marked) / self.peak * 100.0 >= d
-                }) {
-                    0.5
-                } else {
-                    1.0
-                };
             let regime = regime_allows(m, t, p.regime);
-            let (target, top, slot) = if self.entries_allowed && regime {
-                funded_targets(m, scores, t, p, usable, self.cost_mult, scale)
+            let (target, top, slot) = if self.entries_allowed && regime && !self.stopped_out {
+                funded_targets(m, scores, t, p, usable, self.cost_mult)
             } else {
                 (BTreeMap::new(), 0, 0.0)
             };
@@ -1083,6 +1184,8 @@ impl XsPortfolio {
             self.pending_slot = slot;
             self.allocation_note = if !self.entries_allowed {
                 "entry gate disabled".into()
+            } else if self.stopped_out {
+                format!("stopped out: drawdown reached {DRAWDOWN_STOP_PCT}%, no new positions until the next fresh reset")
             } else if !regime {
                 "regime filter: BTC below its 24h average, no entries".into()
             } else if usable < MIN_ENTRY_BALANCE {
@@ -1118,7 +1221,7 @@ impl XsPortfolio {
         t: usize,
         p: &XsParams,
     ) -> BTreeMap<usize, Side> {
-        if !self.entries_allowed || !regime_allows(m, t, p.regime) {
+        if self.stopped_out || !self.entries_allowed || !regime_allows(m, t, p.regime) {
             return BTreeMap::new();
         }
         funded_targets(
@@ -1128,7 +1231,6 @@ impl XsPortfolio {
             p,
             self.equity + self.unrealized() - self.reserved,
             self.cost_mult,
-            1.0,
         )
         .0
     }
@@ -1811,6 +1913,119 @@ mod tests {
     }
 
     #[test]
+    fn drawdown_stop_closes_everything_and_blocks_new_entries() {
+        // Price falls 40% at 2x on most of the account: marked equity drops > 25%.
+        let m = flat_with(&[
+            (101, (100.0, 100.0, 60.0, 60.0)),
+            (102, (60.0, 60.0, 60.0, 60.0)),
+        ]);
+        let p = risk_params(Risk {
+            add_pct: Some(1.0),
+            ..Default::default()
+        });
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 400.0, &p);
+        pf.step(&m, &[vec![None; 200]], 100, &p);
+        assert!(!pf.stopped_out);
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!(
+            pf.stopped_out,
+            "-40% on 800 notional is about -32% of equity"
+        );
+        pf.step(&m, &[vec![None; 200]], 102, &p);
+        assert!(pf.positions.is_empty());
+        assert_eq!(pf.trades.last().unwrap().reason, "Drawdown stop");
+        // Nothing opens or adds afterwards.
+        pf.step(&m, &[vec![None; 200]], 103, &p);
+        assert!(pf.positions.is_empty());
+        assert!(pf.pending_targets.as_ref().is_none_or(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn stops_trigger_on_mark_price_not_on_traded_wicks() {
+        // Bar 101: the traded low wicks to 80 but the mark only dips to 95.
+        let mut m = flat_with(&[(101, (100.0, 100.0, 80.0, 99.0))]);
+        m.marks[0][101] = Some(crate::engine::Bar {
+            open: 100.0,
+            high: 100.0,
+            low: 95.0,
+            close: 99.0,
+            volume: 0.0,
+            turnover: 0.0,
+        });
+        let mut p = risk_params(Risk::default());
+        p.stop_pct = Some(10.0);
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.step(&m, &[vec![None; 200]], 100, &p);
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert_eq!(pf.positions.len(), 1, "a last-trade wick must not stop out");
+        // When the mark itself reaches the stop, it fires.
+        m.marks[0][102] = Some(crate::engine::Bar {
+            open: 99.0,
+            high: 99.0,
+            low: 85.0,
+            close: 90.0,
+            volume: 0.0,
+            turnover: 0.0,
+        });
+        pf.step(&m, &[vec![None; 200]], 102, &p);
+        assert!(pf.positions.is_empty());
+        assert_eq!(pf.trades[0].reason, "Stop");
+    }
+
+    #[test]
+    fn live_exits_lock_in_and_book_at_the_bar_after_its_funding() {
+        let mut m = flat_with(&[]);
+        let mut p = risk_params(Risk::default());
+        p.stop_pct = Some(5.0);
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.step(&m, &[vec![None; 200]], 100, &p);
+        // Funding settles at the open of bar 101; the live stop fires inside it.
+        m.funding[0] = vec![(101 * BAR_MS, 0.001)];
+        let marks = std::collections::HashMap::from([("AUSDT".to_string(), 94.0)]);
+        let at = 101 * BAR_MS + 5 * 60_000;
+        let lines = pf.live_check(&marks, at);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !pf.live_check(&marks, at + 1)
+                .iter()
+                .any(|l| l.contains("stop hit")),
+            "locked once"
+        );
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!(pf.positions.is_empty());
+        let t = &pf.trades[0];
+        assert_eq!((t.reason.as_str(), t.exit_ts), ("Stop (live mark)", at));
+        assert!(
+            t.funding > 0.0,
+            "the settlement before the live exit is paid"
+        );
+        assert!(
+            t.exit < 94.0 && t.exit > 93.0,
+            "mark minus measured book cost: {}",
+            t.exit
+        );
+    }
+
+    #[test]
+    fn live_drawdown_stop_closes_everything_and_blocks_entries() {
+        let m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 400.0, &p);
+        pf.step(&m, &[vec![None; 200]], 100, &p);
+        // ~800 notional at 2x: a mark of 66 is about -27% of equity.
+        let marks = std::collections::HashMap::from([("AUSDT".to_string(), 66.0)]);
+        let lines = pf.live_check(&marks, 101 * BAR_MS + 1);
+        assert!(pf.stopped_out && lines.iter().any(|l| l.contains("drawdown stop")));
+        pf.step(&m, &[vec![None; 200]], 101, &p);
+        assert!(pf.positions.is_empty());
+        assert_eq!(pf.trades[0].reason, "Drawdown stop (live mark)");
+    }
+
+    #[test]
     fn settlement_at_the_newest_close_waits_for_the_next_bar() {
         let mut m = flat_with(&[]);
         let p = risk_params(Risk::default());
@@ -2202,10 +2417,15 @@ mod tests {
             ..Default::default()
         });
         let mut pf = XsPortfolio::new(1000.0);
+        // 400 budget at 1x = ~400 notional: -40% is -16% of equity, past the
+        // 10% breaker but short of the 25% drawdown stop.
+        let mut p = p;
+        p.gross_leverage = 1.0;
         pf.open(&m, 100, 0, Side::Long, 400.0, &p);
         pf.step(&m, &s, 100, &p);
         pf.step(&m, &s, 101, &p);
         assert!(pf.flatten_next, "-40% on 400 notional = -16% equity");
+        assert!(!pf.stopped_out);
         pf.step(&m, &s, 102, &p);
         assert!(pf.positions.is_empty());
         assert_eq!(pf.trades.last().unwrap().reason, "Breaker");
@@ -2241,7 +2461,7 @@ mod tests {
 
     /// With adds on, each slot keeps room for its add: base + add == the slot.
     #[test]
-    fn sizing_reserves_room_for_the_add() {
+    fn averaging_down_never_halves_the_first_order() {
         let m = market(&wavy(200));
         let s = sc(&m);
         let mut p = risk_params(Risk::default());
@@ -2255,7 +2475,7 @@ mod tests {
         let with_add = stepped(&m, &s, 150..161, &p);
         assert!(!plain.positions.is_empty());
         let total = |pf: &XsPortfolio| pf.positions.iter().map(|x| x.margin).sum::<f64>();
-        assert!((total(&with_add) * 2.0 - total(&plain)).abs() / total(&plain) < 0.01);
+        assert!((total(&with_add) - total(&plain)).abs() / total(&plain) < 1e-9);
     }
 
     #[test]

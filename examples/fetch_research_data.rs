@@ -24,7 +24,7 @@ async fn holdout(client: &Client, windows: &str) -> anyhow::Result<()> {
     let dir = bybit_mean_reversion_bot::engine::runtime_dir().join("holdout");
     std::fs::create_dir_all(&dir)?;
     let lots = client.usdt_perpetual_lots().await?;
-    let trading: HashSet<String> = lots.iter().map(|(s, _, _)| s.clone()).collect();
+    let trading: HashSet<String> = lots.iter().map(|i| i.symbol.clone()).collect();
     println!(
         "{} USDT perpetual tokens trading, no delisting scheduled",
         lots.len()
@@ -34,13 +34,11 @@ async fn holdout(client: &Client, windows: &str) -> anyhow::Result<()> {
         let (first, last) = research::window_bounds(k);
         let cache = Cache::open(research::window_file(&dir, k).to_str().unwrap_or_default())?;
         let purged = cache.retain_symbols(&trading)?;
-        let alive: Vec<&(String, Option<data::LotFilter>, i64)> = lots
-            .iter()
-            .filter(|(_, _, launch)| *launch <= last)
-            .collect();
-        cache.put_instruments(&alive.iter().map(|x| (*x).clone()).collect::<Vec<_>>())?;
+        let alive: Vec<data::Instrument> =
+            lots.iter().filter(|i| i.launch <= last).cloned().collect();
+        cache.put_instruments(&alive)?;
         let (client, cache2) = (client, &cache);
-        let mut jobs = stream::iter(alive.iter().map(|(s, _, _)| s.clone()))
+        let mut jobs = stream::iter(alive.iter().map(|i| i.symbol.clone()))
             .map(|s| async move {
                 let since = cache2.bars_since(&s, first, last)?;
                 if since <= last {
@@ -82,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         client.usdt_account(&creds).await?.wallet
     );
     let lots = client.usdt_perpetual_lots().await?;
-    let trading: HashSet<String> = lots.iter().map(|(s, _, _)| s.clone()).collect();
+    let trading: HashSet<String> = lots.iter().map(|i| i.symbol.clone()).collect();
     let candidates = client
         .top_margin_tokens(&lots, walkforward::CANDIDATES)
         .await?;
@@ -90,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let rules = client.fetch_rules(&creds, &candidates).await?;
     let measured = rules.iter().map(|(s, _)| s.clone()).collect();
     let lots = data::universe(&candidates, &measured, walkforward::UNIVERSE);
-    let symbols: Vec<String> = lots.iter().map(|(s, _, _)| s.clone()).collect();
+    let symbols: Vec<String> = lots.iter().map(|i| i.symbol.clone()).collect();
     println!(
         "rules for {} of {} candidates; universe {} coins",
         rules.len(),

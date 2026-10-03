@@ -46,7 +46,7 @@ The first `n` (20) candidates, in turnover order, that have stored rules. A coin
 
 ## `struct Cache`
 
-SQLite (WAL) with tables `bars`, `marks`, `funding`, `rules` (JSON), `instruments` (launch times), `first_trades` and `universe`.
+SQLite (WAL) with tables `bars`, `marks`, `funding`, `rules` (JSON), `instruments` (launch times and Bybit funding intervals), `first_trades` and `universe`.
 
 | Function | What it does |
 |---|---|
@@ -62,4 +62,8 @@ SQLite (WAL) with tables `bars`, `marks`, `funding`, `rules` (JSON), `instrument
 
 ## `sync(client, cache, symbols, progress)`
 
-Brings every symbol's last 14 days up to date and returns the last fully closed bar. Bars are fetched from the first missing candle (recording a new listing's first trade), then mark candles likewise, then funding from 8 hours before the newest stored settlement. Up to 6 symbols in flight, globally paced. A failing symbol is skipped for the bar with a warning; more than 20% failing is an error. Data older than 16 days is pruned.
+Brings every symbol's last 14 days up to date and returns the last fully closed bar. Bars are fetched from the first missing candle (recording a new listing's first trade), then mark candles likewise. Funding is fetched only when the instrument's real Bybit `fundingInterval` says the next settlement is due; the request overlaps by one interval to catch revisions. Up to 6 symbols in flight, globally paced. A failing symbol is skipped for the bar with a warning; more than 20% failing is an error. Data older than 16 days is pruned.
+
+### Explicit synchronization outcome
+
+`sync` returns `SyncOutcome { last_closed, failed_symbols }`. A successful candle cache check does not excuse a failed funding request when funding is due. When no settlement is due, cached funding is already complete for that bar and the endpoint is not called. The service excludes failed candidates and blocks replay for a failed held symbol; the CLI refuses to backtest that outcome. The tolerated 20% failure threshold remains for unheld candidates. `funding_failure_is_reported_even_with_complete_candles` exercises the production HTTP/parser path with complete candle caches and a due funding API error; `funding_history_is_not_refetched_before_the_next_real_settlement` proves no needless funding call is made between settlements.

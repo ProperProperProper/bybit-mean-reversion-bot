@@ -1,6 +1,6 @@
 # Notes for agents (Codex, Claude) working on this repo
 
-Last updated 2026-10-03 by Claude Code (with Codex's review items). Read this, CLAUDE.md and the `NOTE(agents)` comments before changing anything.
+Last updated 2026-10-03 by Codex with an independent agent audit and user policy overrides. Read this, CLAUDE.md and the `NOTE(agents)` comments before changing anything.
 
 ## Mandatory fresh-data rule — user instruction, 2 October 2026
 
@@ -34,7 +34,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - **Lifecycle and timing must be right before anyone relies on paper P&L or optimizer results** (2026-10-03). See "Lifecycle and timing rules" below; do not loosen them.
 - **Entry wick guard:** entries and adds fill only when the traded open is within `xs::ENTRY_WICK_GUARD_PCT` (0.5%) of the mark open; otherwise they wait for the next open. Entries fill at TRADED prices (never at the mark).
 - **Live, wick-safe stops:** `price_task` watches Bybit's WebSocket mark price for held coins; `XsPortfolio::live_check` locks in exits, booked by the next bar after its funding. Stops trigger on MARK price, never on last-trade wicks; candles are the fallback.
-- **25% drawdown stop:** `xs::DRAWDOWN_STOP_PCT`; at 25% below the peak everything closes and nothing opens until the next fresh reset (`stopped_out` is never re-armed automatically).
+- **25% drawdown stop:** `xs::DRAWDOWN_STOP_PCT`; at 25% below the cycle peak everything exits; after a 15-minute cooldown and completed exits, valid entries are re-evaluated without waiting for the normal holding period. Global drawdown history remains intact.
 - **Never halve the budget:** no half size after drawdowns, no half slot reserved for averaging down. Every slot gets its full share of the free balance.
 - **Parameter search:** ONE 14-day window, never split; test EVERY parameter (`walkforward::LIVE_COMBOS` = 1,474,560, all 8 signals both ways, about 12 min). The next search starts 60 minutes after the previous one FINISHES (`search_task`), never per candle. Champion/challenger: the search's best replaces the settings in use only if it scores strictly higher; the two safety rules (no liquidation, drawdown <= 25% over the 14 days) always apply.
 - **Long only.** Do not bring back shorts or market-neutral as the live mode unless the user asks.
@@ -42,12 +42,12 @@ Keep them current: if you change the behaviour a note describes, update or remov
 - **Strict exclusion:** delisted, delisting, missing/invalid-leverage and 1x-only contracts are rejected before ranking, fetching or scoring; their stored rows are deleted every bar; a held ineligible symbol stops the bar for explicit recovery.
 - **5 USDT floor:** no entries or adds while the free balance (wallet minus margin committed anywhere on the account) is below 5 USDT.
 - **Real data and real code paths only.** Never fill a missing candle, fee, tier or balance with an invented value.
-- No dead code; strict clippy clean. The user works unattended: don't stop to ask. After every change: tests, commit, push, `./deploy.sh` (fresh reset). When a complete Codex change is detected, Claude commits (crediting Codex), pushes and deploys it.
+- No dead code; strict clippy clean. The user works unattended: don't stop to ask. After every change: tests, commit, push, `./deploy.sh` (fresh reset). Claude normally reviews Codex changes; when Claude cannot review, Codex performs and records the review before committing, pushing and deploying.
 - Report results honestly, including losses. Don't tune on test windows until a number looks good.
 
 ## Lifecycle and timing rules (fixed 2026-10-03)
 
-- **Decision latency (`xs::decision_fill_bound`):** a decision taken at bar t's close fills no earlier than bar t+2's open, in backtests, the search, the forward chart, research tools and paper alike. Live, bar t is processed after its close, so t+1's open is already gone. Each decision is stamped once, when made; re-reaching the same decision at a later close keeps its bound (re-stamping slid adds and breakers forward forever). Live, `defer_new_decisions(now)` raises every pending bound to the next open after `now`.
+- **Decision latency (`xs::decision_fill_bound`):** a decision taken at bar t's close fills no earlier than bar t+2's open, in backtests, the search, the forward chart, research tools and paper alike. Live, bar t is processed after its close, so t+1's open is already gone. Each decision is stamped once, when made; re-reaching the same decision at a later close keeps its bound (re-stamping slid adds and breakers forward forever). Live, `defer_new_decisions(now, decision_bar_ts)` adjusts only decisions created at that close; existing queued bounds remain fixed.
 - **Resting orders are not delayed:** intrabar stops, liquidation and live WebSocket exits act at once, as on the exchange.
 - **Flattens (breaker, close-based drawdown stop)** carry their own bound (`flatten_not_before`); they never fill at an open that had passed before they were decided.
 - **Volatility weights** are fixed at the decision close (`pending_weights`, keyed by symbol name) and reused by a delayed fill; never recomputed at execution.
@@ -65,7 +65,7 @@ Keep them current: if you change the behaviour a note describes, update or remov
 
 ## Current state (2026-10-03)
 
-- All findings in `docs/audit.md` are fixed with regression tests (74 tests), including the 2026-10-03 lifecycle/timing fixes above.
+- The working tree includes the additional production-path and drawdown-recovery fixes in `docs/audit.md`. Final test results and deployment status must be checked before treating the running process as updated.
 - Live grid: `walkforward::live_combo(i)` for `i < LIVE_COMBOS`: every parameter (docs/walkforward.md), long only.
 - Results recorded before 2026-10-03 (docs/validation.md) used next-open fills and the old split walk-forward; they are history, not validation of the current timing. Judge the current system by the dashboard's chronological forward chart and the live paper account.
 
@@ -101,3 +101,26 @@ Keep them current: if you change the behaviour a note describes, update or remov
 Tests must use the production engine and actual eligibility, quantity/minimum-order, free-balance, fee, funding, mark/liquidation and decision-time rules whenever claiming to represent the bot. Never use a simplified profitable surrogate or future information. State what the test measures: unit regression, historical simulation, prospective paper run or actual exchange execution.
 
 Historical simulations are not verified live execution: current universe/books/fees/tiers applied to past candles, unverified history coverage and report latency, and candle-level intrabar ambiguity must be disclosed. Do not present simulated fills as exchange fills or historical returns as live account profit. The chart exposes its assumptions. A true live-parity claim requires replaying recorded decision/report timestamps and contemporaneous account/market inputs through the same paper-service path, with independent outcomes; actual exchange fills require exchange execution records.
+
+## Mandatory peer awareness and review — user instruction
+
+- Codex, Claude and oMLX must read `bybit_inspector.peer_activity` and `task_board` before work, and publish planned/started/progress/completed/blocked actions using `report_action`. Before a conflicting edit, claim the code-change lane. Report edits, test results and deployment status without credentials, account amounts, raw prompts or logs. Unreported actions are not automatically visible; never claim another agent has read a notice without evidence.
+- The shared model router automatically supplies peer metadata to bounded oMLX/Claude calls and records their start/outcome. Do not bypass this route with an uninstrumented model call for this workflow.
+- **Every change, including follow-up edits after approval, requires a fresh actual Claude review before pushing or restarting the bot; when Claude is unavailable or capacity-limited, actual Codex review can approve instead (user override 2026-10-03).** Approval is bound to the exact source/instruction/config/test fingerprint. No automatic approval, no oMLX approval, no reusing approval after an edit. Record the actual reviewer and review findings.
+- Request review through the shared review gate. Rejection, invalid review response, missing approval or changed files blocks push/deployment. Actual Claude unavailability permits a documented Codex review of the same fingerprint; it does not approve automatically. Address findings and request another review. `deploy.sh` checks the gate before destructive reset and restart; the repository's pre-push hook checks before pushing. Never use `--no-verify` or bypass a required gate.
+
+## Shared vetted learning memory — user instruction
+
+- At task startup, retrieve `bybit_inspector.learning_memory` alongside peer activity. Codex, Claude CLI and routed oMLX use the same persistent store outside disposable bot data. Current repository instructions and current source take precedence over older lessons.
+- After a verified outcome, use `submit_lesson` with a concise reusable lesson, reproducible evidence and the relevant source digest. No credentials, account amounts, raw prompts or private logs. Model suggestions alone are not verified outcomes.
+- Use `review_lesson` for actual Claude subscription vetting; if Claude is unavailable, actual Codex review can approve the exact lesson through the fallback receipt. Pending/rejected/superseded records must not enter retrieved working memory. A reviewer assesses supplied evidence; independently run tests and inspect source before applying a lesson.
+- Shared retrieval is contextual learning for hosted Codex/Claude, not modification of their model weights. Local LoRA training is a separate evaluated process; never claim training, improved accuracy or serving until those steps actually succeed.
+- Learning occurs through recorded task outcomes. External actions and idle sessions are not automatically observed. Reconnect clients after MCP/router updates.
+
+## Codex fallback approval — user override (2026-10-03)
+
+If actual Claude review cannot run because the provider is unavailable or capacity-limited, Codex may perform the review instead. This applies to exact-source push/restart approval and vetted lesson approval. Record the actual reviewer, exact fingerprint and concrete findings. Fallback is not automatic approval. Rejection findings still require fixes, and every later edit invalidates source approval. The local receipt is a cooperative record, not proof that a model ran; never issue a receipt without doing the review.
+
+## Drawdown recovery — user override (2026-10-03)
+
+Keep the 25% drawdown exit, but do not permanently disable trading. Re-arm after a 15-minute cooldown only once stopped positions have fully closed, current settings qualify, and free balance is at least 5 USDT. Force a new entry decision rather than waiting for a long rebalance interval; preserve causal execution delay. With timely complete data the bot must be eligible to resume within an hour. Missing funding/prices, incomplete exits or entry-rule failures must display their blocking reason, never invent data or force an invalid order. Preserve global drawdown metrics across cycles; only the cycle risk baseline resets.

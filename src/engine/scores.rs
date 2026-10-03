@@ -252,7 +252,7 @@ pub fn compute_with(m: &Market, universe: usize, tradeable_only: bool) -> Vec<Ve
             .collect();
         members.sort_by(|a, b| b.1.turnover_24h.total_cmp(&a.1.turnover_24h));
         members.truncate(universe);
-        if members.len() < 2 {
+        if members.is_empty() {
             continue;
         }
         let sorted = |f: &dyn Fn(&Raw) -> f64| {

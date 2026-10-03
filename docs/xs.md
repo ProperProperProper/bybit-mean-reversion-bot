@@ -9,12 +9,12 @@ A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned re
 | `MIN_ENTRY_BALANCE` | 5 USDT | No rebalance entry and no add while the free balance is below this. Exits continue. |
 | `NEUTRAL_TOLERANCE` | 2% | Long and short gross notional may differ by at most this fraction, or the rebalance is not placed |
 | `SLOT_HEADROOM` (private) | 0.99 | Share of the free balance a rebalance commits; the rest covers closing the outgoing positions |
-| `DRAWDOWN_STOP_PCT` | 25% | Account drawdown stop: close everything, `stopped_out`, no new positions or adds until the next fresh reset |
+| `DRAWDOWN_STOP_PCT` | 25% | Account drawdown exit: close everything, then a 15-minute cooldown and forced entry re-evaluation when gates pass; global drawdown remains intact |
 | `ENTRY_WICK_GUARD_PCT` | 0.5% | Entries and adds fill only when the traded open is within this of the mark open; otherwise they wait for the next open |
 
 ## Timing and lifecycle
 
-- **Decision latency (`decision_fill_bound`):** a decision taken at bar t's close (rebalance, close-based exit, add, breaker or drawdown flatten) fills no earlier than bar t+2's open, because live bar t is processed after its close. Each decision is stamped once when made; re-reaching the same decision keeps its bound. Live, `defer_new_decisions(now)` raises every pending bound to the next open after `now`.
+- **Decision latency (`decision_fill_bound`):** a decision taken at bar t's close (rebalance, close-based exit, add, breaker or drawdown flatten) fills no earlier than bar t+2's open, because live bar t is processed after its close. Each decision is stamped once when made; re-reaching the same decision keeps its bound. Live, `defer_new_decisions(now, decision_bar_ts)` adjusts only newly created decisions; later reports never slide old pending bounds.
 - **Resting orders are immediate:** intrabar stops (mark-triggered), liquidation and live WebSocket exits.
 - **Volatility weights** are fixed at the decision close (`pending_weights`, by symbol name) and reused by a delayed fill.
 - **Held positions** use fresh rules when present, else the rules measured at entry (`entry_rules`), for exits, funding and liquidation; new orders need fresh rules.
@@ -55,7 +55,7 @@ A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned re
 
 ## `struct Risk`
 
-Each rule is decided on a 15-minute **close** and executed at the **next open**.
+Each rule is decided on a 15-minute **close** and executed no earlier than the **open two bars later**.
 
 | Field | Rule |
 |---|---|
@@ -89,7 +89,7 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 
 **`signal_value(m, scores, s, t, p)`:** the ranking value, negated if `flip`; `None` when the symbol is outside the screener universe or the value is unavailable.
 
-**`targets(m, scores, t, p)`:** the `top` lowest values long and the `top` highest short, ties broken by index.
+**`ranked_targets` (internal; `targets` is a test-only wrapper):** the `top` lowest values long and the `top` highest short, ties broken by index.
 
 **`funded_targets` (private):** the decision used by the portfolio. Starting at `p.top` per side and stepping down to 1, each slot gets `free × scale × 0.99 / slots / (1 + adds)`. A symbol is rankable at that slot only if its measured book can fill the order, Bybit's lot rules accept it, **rounding to the quantity step keeps at least 99% of the notional**, and the leverage is allowed by its tier. The first basket size where every slot fills wins. Returns nothing when the free balance is below `MIN_ENTRY_BALANCE`.
 
@@ -110,7 +110,7 @@ Symbol index and name, side, entry time, average `entry`, `qty`, posted `margin`
 4. Rebalance (if decided earlier and its bound has arrived): waits a bar if any target lacks data or its traded open is a wick (more than `ENTRY_WICK_GUARD_PCT` from the mark open), keeping the decided targets, budget and weights; otherwise closes every position, then opens all legs with the fixed slot budget on a copy. The copy replaces the account only if **every** leg filled and (unless long only) the sides are within `NEUTRAL_TOLERANCE`; otherwise `rejected_rebalances` += 1. No entries while the free balance is below the minimum.
 5. Inside the bar: intrabar funding is refused (it needs finer mark data); mark-price liquidation (open or adverse extreme) first, then the stop, also triggered by the mark (wick-safe), filled at the stop level or the traded open on a gap; then the close-based rules (on the mark close) queue the next action.
 6. Funding stamped at this bar's close is charged at the next bar's mark open. On the newest loaded bar it waits for that bar.
-7. Breaker check, then the **drawdown stop** (marked equity `DRAWDOWN_STOP_PCT` = 25% below its peak: close everything at the next open, `stopped_out`, no new positions or adds for the rest of the run), then `decide_close`, then peak and drawdown.
+7. Breaker check, then the **drawdown stop** (marked equity `DRAWDOWN_STOP_PCT` = 25% below its peak: queue a causal exit of every position, `stopped_out`, then re-arm after a 15-minute cooldown and completed exits when entry gates pass), then `decide_close`, then peak and drawdown.
 
 **`live_check(marks, now)`** is called by the live WebSocket monitor with fresh mark prices: it locks in `live_exit` (time, mark, reason) for every position whose stop the mark has reached, and for every position when marked equity is 25% below its peak (`stopped_out`). Step 2½: right after the opening funding and gap liquidation, each bar books the live exits that fall inside it, at the recorded mark (with measured book cost) and time.
 

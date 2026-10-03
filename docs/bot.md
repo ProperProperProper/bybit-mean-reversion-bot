@@ -66,3 +66,9 @@ A minimal HTTP server: `/` (the page), `/api/status`, `/api/signals`, `/api/rese
 ## Deployment (`deploy.sh`)
 
 Builds, runs every test target and strict clippy, stops and verifies the old service/process, deletes stale runtime data, and refetches real research windows before it installs to `~/Library/Application Support/BybitMeanReversionBot/bin/bot`, and (re)starts the launchd job `com.bybitmeanreversion.bot`, failing if launchd does not accept it. The installed binary is re-signed ad hoc with a fixed identifier (`SIGN_ID`), which the LuLu firewall allow rule for that path expects. Without that, every rebuild gets a new linker identifier, and the bot's connections wait on a firewall prompt.
+
+### Drawdown recovery and live execution limits
+
+The 25% exit remains active. Reopening is re-evaluated after a 15-minute cooldown and completed exits, without waiting for a long holding period. Production service regressions cover observed reopening within an hour under timely closed-bar reports for candle and WebSocket triggers. Missing inputs, unsettled exits, less than 5 USDT free balance or unqualified settings still block entries and must be reported. Global drawdown remains measured over the full run. Mark-triggered paper exits use mark plus measured book cost as a modeled fill, not a contemporaneous exchange execution.
+
+Persist risk peaks and drawdown even when a live check emits no exit. The next search deadline is measured from the completed search; building the initial historical chart uses time inside that pause.

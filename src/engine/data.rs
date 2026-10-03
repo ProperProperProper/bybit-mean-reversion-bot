@@ -35,6 +35,26 @@ pub struct LotFilter {
     pub max_market_qty: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instrument {
+    pub symbol: String,
+    pub lot: Option<LotFilter>,
+    pub launch: i64,
+    pub funding_interval_ms: i64,
+}
+
+#[cfg(test)]
+impl Instrument {
+    fn test(symbol: &str, lot: Option<LotFilter>, launch: i64) -> Self {
+        Self {
+            symbol: symbol.into(),
+            lot,
+            launch,
+            funding_interval_ms: 8 * 3_600_000,
+        }
+    }
+}
+
 // NOTE(agents): User requirement: real data only. Never add a fallback/default value for a missing
 //               Bybit field; drop the row, skip the symbol, or fail.
 /// A number Bybit sent (string or number); None if missing or unparsable,
@@ -108,7 +128,7 @@ impl Client {
 
     /// Trading USDT linear perpetuals with parsed lot filters, excluding
     /// scheduled delistings. An incomplete filter returns None for that symbol.
-    pub async fn usdt_perpetual_lots(&self) -> Result<Vec<(String, Option<LotFilter>, i64)>> {
+    pub async fn usdt_perpetual_lots(&self) -> Result<Vec<Instrument>> {
         let mut out = Vec::new();
         let mut cursor = String::new();
         loop {
@@ -140,7 +160,18 @@ impl Client {
                         .and_then(|s| s.parse::<i64>().ok())
                         .filter(|t| *t > 0)
                         .ok_or_else(|| anyhow!("instrument {symbol}: invalid launchTime"))?;
-                    out.push((symbol.to_string(), lot, launch));
+                    let funding_interval_ms = i["fundingInterval"]
+                        .as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .filter(|minutes| *minutes > 0)
+                        .ok_or_else(|| anyhow!("instrument {symbol}: invalid fundingInterval"))?
+                        * 60_000;
+                    out.push(Instrument {
+                        symbol: symbol.to_string(),
+                        lot,
+                        launch,
+                        funding_interval_ms,
+                    });
                 }
             }
             cursor = r["nextPageCursor"].as_str().unwrap_or_default().to_string();
@@ -148,7 +179,7 @@ impl Client {
                 break;
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
         Ok(out)
     }
 
@@ -158,9 +189,9 @@ impl Client {
     /// Current top margin-eligible token perpetuals by public 24h turnover.
     pub async fn top_margin_tokens(
         &self,
-        instruments: &[(String, Option<LotFilter>, i64)],
+        instruments: &[Instrument],
         count: usize,
-    ) -> Result<Vec<(String, Option<LotFilter>, i64)>> {
+    ) -> Result<Vec<Instrument>> {
         let r = self.get("/v5/market/tickers", "category=linear").await?;
         let rows = r["list"]
             .as_array()
@@ -168,17 +199,17 @@ impl Client {
         let mut ranked = Vec::new();
         // An instrument without a ticker or a valid turnover cannot be ranked
         // this bar (e.g. just listed); it is left out rather than guessed.
-        for item in instruments.iter().filter(|(_, lot, _)| lot.is_some()) {
+        for item in instruments.iter().filter(|item| item.lot.is_some()) {
             let turnover = rows
                 .iter()
-                .find(|r| r["symbol"].as_str() == Some(item.0.as_str()))
+                .find(|r| r["symbol"].as_str() == Some(item.symbol.as_str()))
                 .and_then(|row| strict(&row["turnover24h"]))
                 .filter(|v| *v >= 0.0);
             if let Some(turnover) = turnover {
                 ranked.push((turnover, item.clone()));
             }
         }
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)));
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.symbol.cmp(&b.1.symbol)));
         anyhow::ensure!(
             ranked.len() >= count,
             "only {} eligible margin tokens",
@@ -351,13 +382,14 @@ impl Client {
     pub async fn fetch_rules(
         &self,
         creds: &Credentials,
-        lots: &[(String, Option<LotFilter>, i64)],
+        lots: &[Instrument],
     ) -> Result<Vec<(String, Rules)>> {
         let fees = self.taker_fees(creds).await?;
         let tiers = self.risk_limits().await?;
         let mut out = Vec::new();
-        for (s, lot, _) in lots {
-            let (Some(l), Some(&fee), Some(t)) = (lot, fees.get(s), tiers.get(s)) else {
+        for item in lots {
+            let s = &item.symbol;
+            let (Some(l), Some(&fee), Some(t)) = (&item.lot, fees.get(s), tiers.get(s)) else {
                 continue;
             };
             let Ok((bids, asks, ts)) = self.orderbook(s).await else {
@@ -384,7 +416,7 @@ impl Client {
         // A refresh replaces the stored snapshot: one that lost most symbols
         // (an API change or outage) must fail instead of wiping the rules.
         anyhow::ensure!(
-            out.len() * 2 >= lots.iter().filter(|(_, lot, _)| lot.is_some()).count(),
+            out.len() * 2 >= lots.iter().filter(|item| item.lot.is_some()).count(),
             "rules measured for only {} of {} symbols; keeping the previous snapshot",
             out.len(),
             lots.len()
@@ -652,13 +684,13 @@ mod eligibility_tests {
 /// The symbols to measure rules for: the turnover candidates plus every held
 /// symbol that is still an eligible instrument (taken from `eligible`).
 pub fn with_held(
-    candidates: &[(String, Option<LotFilter>, i64)],
-    eligible: &[(String, Option<LotFilter>, i64)],
+    candidates: &[Instrument],
+    eligible: &[Instrument],
     held: &[String],
-) -> Vec<(String, Option<LotFilter>, i64)> {
+) -> Vec<Instrument> {
     let mut out = candidates.to_vec();
     for item in eligible {
-        if held.contains(&item.0) && !out.iter().any(|c| c.0 == item.0) {
+        if held.contains(&item.symbol) && !out.iter().any(|c| c.symbol == item.symbol) {
             out.push(item.clone());
         }
     }
@@ -667,15 +699,16 @@ pub fn with_held(
 
 /// The first `n` of `candidates` (ranked by turnover) that have complete Bybit
 /// rules: coins without margin tiers, fee, lot filter or a measurable book are
-/// left out and the next coin by turnover takes the place.
+/// left out. Selection stays within the supplied candidates; live callers pass
+/// only the top 20, so missing rules reduce the count rather than widen scanning.
 pub fn universe(
-    candidates: &[(String, Option<LotFilter>, i64)],
+    candidates: &[Instrument],
     measured: &std::collections::HashSet<String>,
     n: usize,
-) -> Vec<(String, Option<LotFilter>, i64)> {
+) -> Vec<Instrument> {
     candidates
         .iter()
-        .filter(|(s, _, _)| measured.contains(s))
+        .filter(|item| measured.contains(&item.symbol))
         .take(n)
         .cloned()
         .collect()
@@ -727,10 +760,20 @@ impl Cache {
              CREATE TABLE IF NOT EXISTS funding (symbol TEXT, ts INTEGER, rate REAL, PRIMARY KEY (symbol, ts));
              CREATE TABLE IF NOT EXISTS marks (symbol TEXT, ts INTEGER, open REAL, high REAL, low REAL, close REAL, PRIMARY KEY (symbol, ts));
              CREATE TABLE IF NOT EXISTS rules (symbol TEXT PRIMARY KEY, json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS instruments (symbol TEXT PRIMARY KEY, launch_ts INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS instruments (symbol TEXT PRIMARY KEY, launch_ts INTEGER NOT NULL, funding_interval_ms INTEGER NOT NULL DEFAULT 28800000);
              CREATE TABLE IF NOT EXISTS first_trades (symbol TEXT PRIMARY KEY, ts INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS universe (symbol TEXT PRIMARY KEY);",
         )?;
+        let cols = c
+            .prepare("PRAGMA table_info(instruments)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !cols.iter().any(|name| name == "funding_interval_ms") {
+            c.execute(
+                "ALTER TABLE instruments ADD COLUMN funding_interval_ms INTEGER NOT NULL DEFAULT 28800000",
+                [],
+            )?;
+        }
         Ok(Cache(Arc::new(Mutex::new(c))))
     }
 
@@ -739,14 +782,19 @@ impl Cache {
     }
 
     /// Persist exchange listing timestamps independently of optional trading rules.
-    pub fn put_instruments(&self, instruments: &[(String, Option<LotFilter>, i64)]) -> Result<()> {
+    pub fn put_instruments(&self, instruments: &[Instrument]) -> Result<()> {
         self.with(|c| {
             let tx = c.transaction()?;
-            for (symbol, _, launch) in instruments {
-                anyhow::ensure!(*launch > 0, "invalid listing timestamp for {symbol}");
+            for item in instruments {
+                anyhow::ensure!(item.launch > 0, "invalid listing timestamp for {}", item.symbol);
+                anyhow::ensure!(
+                    item.funding_interval_ms > 0,
+                    "invalid funding interval for {}",
+                    item.symbol
+                );
                 tx.execute(
-                    "INSERT OR REPLACE INTO instruments VALUES (?1,?2)",
-                    params![symbol, launch],
+                    "INSERT OR REPLACE INTO instruments(symbol, launch_ts, funding_interval_ms) VALUES (?1,?2,?3)",
+                    params![item.symbol, item.launch, item.funding_interval_ms],
                 )?;
             }
             tx.commit()?;
@@ -787,6 +835,17 @@ impl Cache {
             )
             .optional()?;
         Ok(launch.map(|t| (((t + BAR_MS - 1) / BAR_MS) * BAR_MS).max(first.unwrap_or(0))))
+    }
+
+    pub fn funding_interval_ms(&self, symbol: &str) -> Result<Option<i64>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT funding_interval_ms FROM instruments WHERE symbol=?1",
+                [symbol],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+        })
     }
 
     /// First candle at or after `earliest` that is missing from `table`
@@ -1039,15 +1098,22 @@ impl Cache {
 
 // NOTE(agents): Up to 20% of symbols may fail per bar; they sit out (service skips incomplete
 //               symbols unless held). Keep it tolerant: one exchange gap used to stall every bar.
+/// Explicit fetch outcome: complete candles alone cannot prove funding freshness.
+#[derive(Debug)]
+pub struct SyncOutcome {
+    pub last_closed: i64,
+    pub failed_symbols: Vec<String>,
+}
+
 /// Bring the cache up to date for all symbols (incremental, up to 6 requests in
-/// flight, globally paced), returning the last fully closed bar timestamp. A
+/// flight, globally paced), returning the last closed timestamp and explicit failed symbols. A
 /// symbol that fails is skipped for this bar; more than 20% failing is an error.
 pub async fn sync(
     client: &Client,
     cache: &Cache,
     symbols: &[String],
     mut progress: impl FnMut(usize, usize),
-) -> Result<i64> {
+) -> Result<SyncOutcome> {
     use futures_util::{stream, StreamExt};
     let now = chrono::Utc::now().timestamp_millis();
     let last_closed = (now - 3_000) / BAR_MS * BAR_MS - BAR_MS;
@@ -1071,8 +1137,12 @@ pub async fn sync(
             cache.put_marks(&s, &client.mark_range(&s, msince, last_closed).await?)?;
         }
         let last_f = cache.last_funding_ts(&s)?;
-        {
-            let fsince = last_f.map_or(earliest, |t| earliest.max(t - 8 * 3_600_000));
+        let interval = cache
+            .funding_interval_ms(&s)?
+            .ok_or_else(|| anyhow!("funding {s}: missing instrument funding interval"))?;
+        let funding_due = last_f.is_none_or(|t| t + interval <= last_closed + BAR_MS);
+        if funding_due {
+            let fsince = last_f.map_or(earliest, |t| earliest.max(t - interval));
             let f = client
                 .funding_since(&s, fsince)
                 .await
@@ -1082,13 +1152,16 @@ pub async fn sync(
         anyhow::Ok(())
     };
     let mut results = stream::iter(symbols.iter().cloned())
-        .map(one)
+        .map(|symbol| {
+            let job = one(symbol.clone());
+            async move { (symbol, job.await) }
+        })
         .buffer_unordered(6);
     let (mut done, mut failed) = (0usize, Vec::new());
-    while let Some(r) = results.next().await {
+    while let Some((symbol, r)) = results.next().await {
         done += 1;
         if let Err(e) = r {
-            failed.push(format!("{e:#}"));
+            failed.push((symbol, format!("{e:#}")));
         }
         progress(done, symbols.len());
     }
@@ -1097,18 +1170,21 @@ pub async fn sync(
             "sync: {} of {} symbols failed (first: {})",
             failed.len(),
             symbols.len(),
-            failed[0]
+            failed[0].1
         );
     }
     if !failed.is_empty() {
         log::warn!(
             "sync: {} symbol(s) skipped this bar (first: {})",
             failed.len(),
-            failed[0]
+            failed[0].1
         );
     }
     cache.prune(earliest - 2 * 86_400_000)?;
-    Ok(last_closed)
+    Ok(SyncOutcome {
+        last_closed,
+        failed_symbols: failed.into_iter().map(|(symbol, _)| symbol).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -1154,7 +1230,7 @@ mod gap_tests {
         let (launch, boundary, first) = (1_790_844_328_000, 1_790_845_200_000, 1_790_846_100_000);
         let earliest = boundary - 10 * BAR_MS;
         cache
-            .put_instruments(&[("CTUSDT".into(), None, launch)])
+            .put_instruments(&[Instrument::test("CTUSDT", None, launch)])
             .unwrap();
         let b = Bar {
             open: 1.0,
@@ -1190,7 +1266,7 @@ mod gap_tests {
         assert_eq!(m.listing_times, vec![Some(first)]);
         // A symbol listed before the window keeps a leading gap as a real gap.
         cache
-            .put_instruments(&[("OLD".into(), None, earliest - 100 * BAR_MS)])
+            .put_instruments(&[Instrument::test("OLD", None, earliest - 100 * BAR_MS)])
             .unwrap();
         cache.put_bars("OLD", &[(earliest + BAR_MS, b)]).unwrap();
         cache
@@ -1216,7 +1292,10 @@ mod gap_tests {
             cache.put_funding(s, &[(0, 0.0001)]).unwrap();
         }
         cache
-            .put_instruments(&[("BTCUSDT".into(), None, 1), ("GONEUSDT".into(), None, 1)])
+            .put_instruments(&[
+                Instrument::test("BTCUSDT", None, 1),
+                Instrument::test("GONEUSDT", None, 1),
+            ])
             .unwrap();
         cache
             .put_rules(&[(
@@ -1239,7 +1318,7 @@ mod gap_tests {
 
     #[test]
     fn held_symbols_outside_the_candidates_are_still_measured() {
-        let lot = |s: &str| (s.to_string(), None, 1);
+        let lot = |s: &str| Instrument::test(s, None, 1);
         let candidates = vec![lot("BTCUSDT"), lot("ETHUSDT")];
         let eligible = vec![
             lot("BTCUSDT"),
@@ -1250,7 +1329,7 @@ mod gap_tests {
         let held = vec!["DOTUSDT".to_string(), "BTCUSDT".to_string()];
         let names: Vec<String> = with_held(&candidates, &eligible, &held)
             .into_iter()
-            .map(|x| x.0)
+            .map(|x| x.symbol)
             .collect();
         assert_eq!(names, ["BTCUSDT", "ETHUSDT", "DOTUSDT"]);
     }
@@ -1262,13 +1341,13 @@ mod gap_tests {
         cache
             .put_rules(&[("BTCUSDT".into(), r.clone()), ("SOLUSDT".into(), r)])
             .unwrap();
-        let ranked: Vec<(String, Option<LotFilter>, i64)> = ["BTCUSDT", "VVVUSDT", "SOLUSDT"]
+        let ranked: Vec<Instrument> = ["BTCUSDT", "VVVUSDT", "SOLUSDT"]
             .iter()
-            .map(|s| (s.to_string(), None, 1))
+            .map(|s| Instrument::test(s, None, 1))
             .collect();
         let picked: Vec<String> = universe(&ranked, &cache.rules_symbols().unwrap(), 2)
             .into_iter()
-            .map(|x| x.0)
+            .map(|x| x.symbol)
             .collect();
         assert_eq!(picked, ["BTCUSDT", "SOLUSDT"]);
     }
@@ -1320,14 +1399,14 @@ mod gap_tests {
             "unknown listing must retry leading gap"
         );
         cache
-            .put_instruments(&[("A".into(), None, BAR_MS)])
+            .put_instruments(&[Instrument::test("A", None, BAR_MS)])
             .unwrap();
         assert_eq!(cache.bars_since("A", 0, 4 * BAR_MS).unwrap(), 2 * BAR_MS);
         cache.put_bars("A", &[(2 * BAR_MS, b)]).unwrap();
         assert_eq!(cache.bars_since("A", 0, 4 * BAR_MS).unwrap(), 4 * BAR_MS);
         assert_eq!(cache.bars_since("NEW", 0, 4 * BAR_MS).unwrap(), 0);
         cache
-            .put_instruments(&[("NEW".into(), None, 2 * BAR_MS + 1)])
+            .put_instruments(&[Instrument::test("NEW", None, 2 * BAR_MS + 1)])
             .unwrap();
         assert_eq!(cache.bars_since("NEW", 0, 4 * BAR_MS).unwrap(), 3 * BAR_MS);
         let m = cache.market(&["NEW".into()], 4 * BAR_MS).unwrap();
@@ -1343,6 +1422,116 @@ mod gap_tests {
 mod pagination_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn funding_failure_is_reported_even_with_complete_candles() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let last = (now - 3_000) / BAR_MS * BAR_MS - BAR_MS;
+        let earliest = last - (BARS as i64 - 1) * BAR_MS;
+        let cache = Cache::open(":memory:").unwrap();
+        let symbols: Vec<String> = ["FAILED", "A", "B", "C", "D"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let bar = Bar {
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+            turnover: 100.0,
+        };
+        let bars: Vec<_> = (0..BARS)
+            .map(|i| (earliest + i as i64 * BAR_MS, bar))
+            .collect();
+        for symbol in &symbols {
+            cache
+                .put_instruments(&[Instrument::test(symbol, None, earliest)])
+                .unwrap();
+            cache.put_bars(symbol, &bars).unwrap();
+            cache.put_marks(symbol, &bars).unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|x| x == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.contains("/v5/market/funding/history?"));
+                let failed = request.contains("symbol=FAILED&");
+                let body = if failed {
+                    serde_json::json!({"retCode":10001,"retMsg":"fixture funding unavailable"})
+                } else {
+                    serde_json::json!({"retCode":0,"result":{"list":[]}})
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut client = Client::new().unwrap();
+        client.test_base = Some(base);
+        client.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let outcome = sync(&client, &cache, &symbols, |_, _| {}).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(outcome.last_closed, last);
+        assert_eq!(outcome.failed_symbols, vec!["FAILED"]);
+        assert!(cache.bars_since("FAILED", earliest, last).unwrap() > last);
+        assert!(cache.marks_since("FAILED", earliest, last).unwrap() > last);
+        // Complete prices do not make failed funding safe to advance a holding.
+    }
+
+    #[tokio::test]
+    async fn funding_history_is_not_refetched_before_the_next_real_settlement() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let last = (now - 3_000) / BAR_MS * BAR_MS - BAR_MS;
+        let earliest = last - (BARS as i64 - 1) * BAR_MS;
+        let cache = Cache::open(":memory:").unwrap();
+        let symbol = "QUIET";
+        let bar = Bar {
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+            turnover: 100.0,
+        };
+        let bars: Vec<_> = (0..BARS)
+            .map(|i| (earliest + i as i64 * BAR_MS, bar))
+            .collect();
+        cache
+            .put_instruments(&[Instrument::test(symbol, None, earliest)])
+            .unwrap();
+        cache.put_bars(symbol, &bars).unwrap();
+        cache.put_marks(symbol, &bars).unwrap();
+        cache.put_funding(symbol, &[(last, 0.0001)]).unwrap();
+        let mut client = Client::new().unwrap();
+        client.test_base = Some("http://127.0.0.1:9".into());
+        let outcome = sync(&client, &cache, &[symbol.into()], |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed_symbols, Vec::<String>::new());
+        assert_eq!(cache.last_funding_ts(symbol).unwrap(), Some(last));
+    }
 
     // NOTE(agents): This tests the actual public fetch/parser/pagination path.
     // The local endpoint reproduces Bybit's start-only FIRST-page behavior.

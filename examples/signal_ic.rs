@@ -3,7 +3,7 @@
 //!
 //! Every 4 hours (from the screener warm-up on), for each signal and holding
 //! period h: the rank correlation (Spearman) across the universe between the
-//! signal at close t and each coin's return from the next open to the close h
+//! signal at close t and each coin's return from bar t+2's open to the close h
 //! bars later, relative to the universe average (so market moves cancel).
 //! Also the average excess return of the 5 coins a long-only entry buys
 //! (lowest values; the flipped direction is the negative of the highest).
@@ -104,7 +104,7 @@ fn measure(m: &Market, sc: &[Vec<Option<scores::Score>>], p: &xs::XsParams, h: u
             .collect();
         if values.len() >= 2 * PICK {
             let Some(mut rows) = complete_returns(&values, |s| {
-                let entry = m.bars[s][t + 1]?.open;
+                let entry = m.bars[s][t + 2]?.open;
                 let exit = m.bars[s][t + h]?.close;
                 (entry.is_finite() && entry > 0.0 && exit.is_finite() && exit > 0.0)
                     .then_some(exit / entry - 1.0)
@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
         }
     );
     println!("Incomplete decision-time universes are excluded in full; remaining results are conditional on coverage. t-stat assumes independent samples.");
-    println!("IC = mean Spearman(signal, next-open-to-close excess return); t = IC t-stat");
+    println!("IC = mean Spearman(signal, t+2-open-to-close excess return); t = IC t-stat. Earlier next-open holdout results do not validate this changed timing.");
     println!("buy low / buy high = mean excess return (%) of the {PICK} lowest / highest values\n");
     for &signal in walkforward::XS_SIGNALS
         .iter()

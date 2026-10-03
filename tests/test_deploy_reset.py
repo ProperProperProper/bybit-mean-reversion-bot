@@ -35,7 +35,7 @@ class ResetTests(unittest.TestCase):
             source = DEPLOY.read_text()
             block = source[source.index('# NOTE(agents): EVERY deployment'):source.index('mkdir -p "$RUNTIME/bin"')]
             env = dict(os.environ, PATH=str(mock)+os.pathsep+os.environ['PATH'], RUNTIME=str(runtime), LABEL='test.bot')
-            result = subprocess.run(['bash','-c','set -euo pipefail\n'+block], cwd=root, env=env, capture_output=True)
+            result = subprocess.run(['bash','-c','set -euo pipefail\ncheck_review() { :; }\n'+block], cwd=root, env=env, capture_output=True)
             return result.returncode, (runtime/'data.db').exists(), (runtime/'fetched').exists(), (runtime/'bin/bot').read_text()
 
     def test_denied_stop_preserves_active_data(self):

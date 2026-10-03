@@ -1,9 +1,9 @@
-//! Cross-sectional, market-neutral portfolio over the top-20 USDT perpetuals.
+//! Cross-sectional portfolio over the top-20 USDT perpetuals (live: long only).
 //! Every `hold` bars (aligned to timestamps, so backtest and live rebalance at
 //! the same closes) rank the universe by a causal `Signal` (screener scores,
 //! return or settled funding), then hold LONG the `top` lowest and SHORT the
-//! `top` highest, equal notional each. Orders execute at the next open; only
-//! positions that change are traded. Isolated margin per position, real
+//! `top` highest in research's neutral mode. Close-based decisions fill no
+//! earlier than t+2's open; rebalances close and reopen the basket. Isolated margin per position, real
 //! funding, optional protective stop, pessimistic intrabar order.
 
 use super::metrics::{Metrics, Trade};
@@ -24,12 +24,15 @@ pub const MIN_ENTRY_BALANCE: f64 = 5.0;
 pub const NEUTRAL_TOLERANCE: f64 = 0.02;
 // NOTE(agents): User rule (2026-10-03): "if drawdown goes beyond 25% then it should stop out".
 //               At every 15m close, marked equity >= this % below its peak closes everything at
-//               the next open and blocks all entries and adds for the rest of the run (live: until
-//               the next fresh reset). Close-based like the other rules, so a crash inside one
+//               causal future open and blocks entries/adds until exits finish and the one-bar
+//               cooldown expires. Re-entry still requires every entry gate. A crash inside one
 //               candle can overshoot before the next open. The search's safety rule uses the
 //               same value (walkforward::MAX_DRAWDOWN_PCT).
 /// Account drawdown stop, % below the peak of marked equity.
 pub const DRAWDOWN_STOP_PCT: f64 = 25.0;
+/// After a drawdown exit, wait one bar, finish all exits and revalidate entry
+/// gates. Re-entry is evaluated immediately rather than waiting a long hold.
+pub const DRAWDOWN_COOLDOWN_MS: i64 = BAR_MS;
 // NOTE(agents): Decision latency, identical in backtests, the search, the forward chart and paper
 //               (user: fix timing before relying on paper P&L or optimizer results). Bar t is
 //               processed after its close, so live a decision taken at that close can first fill
@@ -109,7 +112,7 @@ pub struct XsParams {
     pub hold: usize,
     pub top: usize,
     /// Leverage of each position. Each of the 2 * `top` slots gets a budget of
-    /// equity / (2 * top) (halved again when `risk.add_pct` must stay fundable)
+    /// equity / slots (top in long-only, 2 * top in neutral mode)
     /// for margin + entry fee, so total exposure is about equity * gross_leverage.
     pub gross_leverage: f64,
     /// Intrabar stop: close the moment price touches this % against the entry.
@@ -200,7 +203,7 @@ pub struct Risk {
     pub vol_scaled: bool,
 }
 
-/// Action decided at a close, executed at the next open.
+/// Action decided at a close, executed no earlier than t+2's open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NextAction {
     Stop,
@@ -231,6 +234,9 @@ pub struct XsPosition {
     pub next_action: Option<NextAction>,
     #[serde(default)]
     pub action_not_before: i64,
+    /// Decision close that created the action; later reports must not restamp it.
+    #[serde(default)]
+    action_decided_at: Option<i64>,
     /// Already added to once.
     #[serde(default)]
     pub added: bool,
@@ -238,6 +244,8 @@ pub struct XsPosition {
     pub fee_rate: f64,
     /// An exit the live mark-price monitor locked in mid-bar: (time ms, mark
     /// price, reason). Booked when that bar is processed, after its funding.
+    /// Mark plus measured book cost is a simulated fill approximation, not
+    /// a contemporaneous executable price or an exchange execution record.
     #[serde(default)]
     pub live_exit: Option<(i64, f64, String)>,
     /// The Bybit rules measured when the position was opened (fee, tiers, book):
@@ -272,12 +280,18 @@ pub struct XsPortfolio {
     pending_params: Option<XsParams>,
     #[serde(default)]
     pending_not_before: i64,
+    #[serde(default)]
+    pending_decided_at: Option<i64>,
     /// Margin + entry fee per slot fixed at the decision close, so the fill
     /// uses exactly the sizes whose lot rounding was checked then.
     #[serde(default)]
     pending_slot: f64,
     pub trades: Vec<Trade>,
     peak: f64,
+    /// Per-cycle stop reference; global `peak` and `max_dd` remain unchanged
+    /// by a resume, so historical drawdown is never erased.
+    #[serde(default)]
+    risk_peak: f64,
     max_dd: f64,
     liquidations: usize,
     /// Cost multiplier on the measured fee and order-book cost (1 = as measured);
@@ -294,14 +308,23 @@ pub struct XsPortfolio {
     /// Breaker tripped at a close: close everything at the next open.
     #[serde(default)]
     flatten_next: bool,
-    // NOTE(agents): Only a fresh reset (new paper account) clears this. Do not add an automatic
-    //               re-arm: the user's rule is "stop out" at 25% drawdown, not pause and resume.
-    /// The drawdown stop fired: everything is closed and nothing new opens.
+    // NOTE(agents): User override: retain the 25% exit but resume within an hour.
+    // One-bar cooldown + finished exits + valid entry gates permit immediate
+    // re-evaluation with the normal causal fill delay. Missing data or insufficient
+    // free balance may prevent a fill; never promise or fabricate one.
+    /// The drawdown stop fired: finish exits before resuming after cooldown.
     #[serde(default)]
     pub stopped_out: bool,
+    #[serde(default)]
+    pub resume_not_before: Option<i64>,
+    /// Force a fresh entry decision after cooldown regardless of holding period.
+    #[serde(default)]
+    resume_pending: bool,
     /// Earliest open at which a pending breaker/drawdown flatten may fill.
     #[serde(default)]
     flatten_not_before: i64,
+    #[serde(default)]
+    flatten_decided_at: Option<i64>,
     /// Inverse-volatility weight per pending target symbol, fixed at the
     /// decision close (mean 1 per side); empty when sizing is equal.
     #[serde(default)]
@@ -318,7 +341,7 @@ fn yes() -> bool {
 
 /// Standard deviation of 15m log returns over the 96 bars ending at bar `t`
 /// (None with fewer than 48 returns).
-pub fn realized_vol(m: &Market, sym: usize, t: usize) -> Option<f64> {
+fn realized_vol(m: &Market, sym: usize, t: usize) -> Option<f64> {
     let from = t.saturating_sub(96);
     let r: Vec<f64> = (from + 1..=t)
         .filter_map(|i| Some((m.bars[sym][i]?.close / m.bars[sym][i - 1]?.close).ln()))
@@ -362,7 +385,7 @@ fn decision_weights(m: &Market, t: usize, target: &BTreeMap<usize, Side>) -> BTr
 }
 
 /// True when bar t's close is a rebalance point (timestamp-aligned).
-pub fn is_rebalance(ts: i64, hold: usize) -> bool {
+fn is_rebalance(ts: i64, hold: usize) -> bool {
     (ts + BAR_MS) % (hold as i64 * BAR_MS) == 0
 }
 
@@ -415,7 +438,8 @@ pub fn signal_value(
 }
 
 /// Target sides at bar t: LONG the `top` lowest signal values, SHORT the `top` highest.
-pub fn targets(
+#[cfg(test)]
+fn targets(
     m: &Market,
     scores: &[Vec<Option<Score>>],
     t: usize,
@@ -442,7 +466,12 @@ fn ranked_targets(
                 let (bar, r) = (m.bars[s][t]?, m.rules(s)?);
                 let notional = (margin / (1.0 / p.gross_leverage + r.taker_fee * cm))
                     .min(r.order_notional_cap(bar.close)?);
-                for side in [Side::Long, Side::Short] {
+                let sides = if p.long_only {
+                    &[Side::Long][..]
+                } else {
+                    &[Side::Long, Side::Short][..]
+                };
+                for &side in sides {
                     let cost = r.book_cost(notional, side == Side::Long)?;
                     let price = bar.close * (1.0 + side.sign() * cost * cm);
                     let qty = r.order_qty(notional / price, price)?;
@@ -451,7 +480,7 @@ fn ranked_targets(
                     //               rounding unbalance fills.
                     // Lot rounding must not unbalance the legs: a contract whose
                     // step is coarse for this slot size cannot be held neutrally.
-                    if qty * price < notional * (1.0 - NEUTRAL_TOLERANCE / 2.0)
+                    if (!p.long_only && qty * price < notional * (1.0 - NEUTRAL_TOLERANCE / 2.0))
                         || !r.leverage_allowed(qty * price, p.gross_leverage)
                     {
                         return None;
@@ -461,7 +490,7 @@ fn ranked_targets(
             Some((s, value))
         })
         .collect();
-    if ranked.len() < 2 * p.top {
+    if ranked.len() < p.slots() {
         return out;
     }
     ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -494,7 +523,8 @@ fn funded_targets(
     if equity < MIN_ENTRY_BALANCE {
         return (BTreeMap::new(), 0, 0.0);
     }
-    for top in (1..=p.top.min(m.symbols.len() / 2)).rev() {
+    let sides = if p.long_only { 1 } else { 2 };
+    for top in (1..=p.top.min(m.symbols.len() / sides)).rev() {
         let mut adaptive = p.clone();
         adaptive.top = top;
         let budget = equity * SLOT_HEADROOM / adaptive.slots() as f64;
@@ -520,9 +550,11 @@ impl XsPortfolio {
             pending_targets: None,
             pending_params: None,
             pending_not_before: 0,
+            pending_decided_at: None,
             pending_slot: 0.0,
             trades: vec![],
             peak: equity,
+            risk_peak: equity,
             max_dd: 0.0,
             liquidations: 0,
             cost_mult: 1.0,
@@ -530,7 +562,10 @@ impl XsPortfolio {
             rebalance_equity: equity,
             flatten_next: false,
             stopped_out: false,
+            resume_not_before: None,
+            resume_pending: false,
             flatten_not_before: 0,
+            flatten_decided_at: None,
             pending_weights: BTreeMap::new(),
         }
     }
@@ -547,13 +582,14 @@ impl XsPortfolio {
         self.equity += delta;
         self.start_equity += delta;
         self.peak += delta;
+        self.risk_peak = (self.risk_peak + delta).max(0.0);
         self.rebalance_equity += delta;
     }
 
     /// Point positions and pending targets at `symbols` by NAME. The live symbol
     /// list is re-fetched every bar, so indices shift when Bybit lists a coin;
-    /// a held position whose symbol is gone (delisted or delisting scheduled)
-    /// is closed at its last mark and never traded again.
+    /// a held position whose symbol is gone fails explicitly: exchange settlement
+    /// data is required, and a last-mark exit must never be invented.
     pub fn reindex(&mut self, symbols: &[String]) {
         let idx: std::collections::HashMap<&str, usize> = symbols
             .iter()
@@ -714,6 +750,17 @@ impl XsPortfolio {
                 done.push(format!("{} stop hit at mark {mark}", pos.symbol));
             }
         }
+        // A portfolio risk decision needs current prices for every open leg.
+        // Individual stops above remain active while another subscription is
+        // stale; never fabricate a contemporaneous liquidation/exit price from
+        // that leg's previous candle mark.
+        if self
+            .positions
+            .iter()
+            .any(|p| p.live_exit.is_none() && !marks.contains_key(&p.symbol))
+        {
+            return done;
+        }
         let marked = self.equity
             + self
                 .positions
@@ -724,31 +771,48 @@ impl XsPortfolio {
                         .as_ref()
                         .map(|x| x.1)
                         .or_else(|| marks.get(&p.symbol).copied())
-                        .unwrap_or(p.mark);
+                        .expect("all live valuations prechecked");
                     p.side.sign() * (price - p.entry) * p.qty
                 })
                 .sum::<f64>();
         let peak = self.peak.max(marked);
+        self.peak = peak;
+        if peak > 0.0 {
+            self.max_dd = self.max_dd.max((peak - marked) / peak * 100.0);
+        }
+        let risk_peak = self.risk_peak.max(marked);
+        self.risk_peak = risk_peak;
         if !self.stopped_out
             && !self.positions.is_empty()
-            && peak > 0.0
-            && (peak - marked) / peak * 100.0 >= DRAWDOWN_STOP_PCT
+            && risk_peak > 0.0
+            && (risk_peak - marked) / risk_peak * 100.0 >= DRAWDOWN_STOP_PCT
         {
             self.stopped_out = true;
+            self.resume_not_before = Some(now_ms + DRAWDOWN_COOLDOWN_MS);
+            self.resume_pending = false;
             self.pending_targets = None;
             self.pending_params = None;
             self.pending_slot = 0.0;
             self.pending_weights.clear();
             for pos in self.positions.iter_mut().filter(|p| p.live_exit.is_none()) {
-                let price = marks.get(&pos.symbol).copied().unwrap_or(pos.mark);
+                let price = marks
+                    .get(&pos.symbol)
+                    .copied()
+                    .expect("all live valuations prechecked");
                 pos.live_exit = Some((now_ms, price, "Drawdown stop (live mark)".into()));
             }
             done.push(format!(
-                "drawdown stop: marked equity {marked:.2} is {:.1}% below its peak {peak:.2}; closing everything",
-                (peak - marked) / peak * 100.0
+                "drawdown stop: marked equity {marked:.2} is {:.1}% below its cycle peak {risk_peak:.2}; closing everything, then re-evaluating after a 15-minute cooldown",
+                (risk_peak - marked) / risk_peak * 100.0
             ));
         }
         done
+    }
+
+    /// Persist these when the live monitor observes a new peak or drawdown,
+    /// even if it did not lock an exit.
+    pub fn risk_watermarks(&self) -> (f64, f64, f64) {
+        (self.peak, self.max_dd, self.risk_peak)
     }
 
     /// Cancel queued entries when the report changes; retain risk exits.
@@ -834,6 +898,7 @@ impl XsPortfolio {
             mark: mark.open,
             next_action: None,
             action_not_before: 0,
+            action_decided_at: None,
             added: false,
             fee_rate: r.taker_fee,
             live_exit: None,
@@ -1092,6 +1157,7 @@ impl XsPortfolio {
                         && gross > 0.0
                         && (p.long_only || (long - short).abs() / gross <= NEUTRAL_TOLERANCE)
                     {
+                        candidate.resume_pending = false;
                         *self = candidate;
                     } else {
                         self.rejected_rebalances += 1;
@@ -1175,6 +1241,7 @@ impl XsPortfolio {
             // Re-reaching the same decision at a later close keeps its original bound
             // (otherwise the bound slides forward every bar and it never fills).
             if decided != pos.next_action {
+                pos.action_decided_at = decided.map(|_| ts);
                 pos.action_not_before = if decided.is_some() {
                     decision_fill_bound(ts)
                 } else {
@@ -1222,11 +1289,15 @@ impl XsPortfolio {
             {
                 self.flatten_next = true;
                 self.flatten_not_before = decision_fill_bound(ts);
+                self.flatten_decided_at = Some(ts);
             }
         }
-        let peak = self.peak.max(marked);
+        let peak = self.risk_peak.max(marked);
+        self.risk_peak = peak;
         if !self.stopped_out && peak > 0.0 && (peak - marked) / peak * 100.0 >= DRAWDOWN_STOP_PCT {
             self.stopped_out = true;
+            self.resume_not_before = Some(ts + BAR_MS + DRAWDOWN_COOLDOWN_MS);
+            self.resume_pending = false;
             self.pending_targets = None;
             self.pending_params = None;
             self.pending_slot = 0.0;
@@ -1239,6 +1310,7 @@ impl XsPortfolio {
             if !self.positions.is_empty() && !self.flatten_next {
                 self.flatten_next = true;
                 self.flatten_not_before = decision_fill_bound(ts);
+                self.flatten_decided_at = Some(ts);
             }
         }
         // 3. Rebalance decision at aligned closes.
@@ -1260,8 +1332,28 @@ impl XsPortfolio {
         t: usize,
         p: &XsParams,
     ) {
-        if p.hold > 0 && is_rebalance(m.ts[t], p.hold) {
+        if self.stopped_out
+            && self
+                .resume_not_before
+                .is_some_and(|at| m.ts[t] + BAR_MS >= at)
+            && self.positions.is_empty()
+            && self.entries_allowed
+            && self.available() >= MIN_ENTRY_BALANCE
+        {
+            self.stopped_out = false;
+            self.risk_peak = self.equity;
+            self.rebalance_equity = self.equity;
+            self.flatten_next = false;
+            self.pending_targets = None;
+            self.pending_params = None;
+            self.pending_weights.clear();
+            self.resume_pending = true;
+        }
+        let resume_decision =
+            self.resume_pending && self.pending_targets.as_ref().is_none_or(Vec::is_empty);
+        if p.hold > 0 && (is_rebalance(m.ts[t], p.hold) || resume_decision) {
             self.pending_not_before = decision_fill_bound(m.ts[t]);
+            self.pending_decided_at = Some(m.ts[t]);
             let marked = self.equity + self.unrealized();
             let usable = marked - self.reserved;
             let regime = regime_allows(m, t, p.regime);
@@ -1275,7 +1367,7 @@ impl XsPortfolio {
             self.allocation_note = if !self.entries_allowed {
                 "entry gate disabled".into()
             } else if self.stopped_out {
-                format!("stopped out: drawdown reached {DRAWDOWN_STOP_PCT}%, no new positions until the next fresh reset")
+                format!("drawdown exit: {DRAWDOWN_STOP_PCT}% reached; finish exits and wait 15 minutes, then re-evaluate entries")
             } else if !regime {
                 "regime filter: BTC below its 24h average, no entries".into()
             } else if usable < MIN_ENTRY_BALANCE {
@@ -1332,18 +1424,18 @@ impl XsPortfolio {
 
     /// Live reports/data received after a candle closes can first fill at a
     /// future opening boundary. Backtests leave this delay unset.
-    pub fn defer_new_decisions(&mut self, ready_ts: i64) {
+    pub fn defer_new_decisions(&mut self, ready_ts: i64, decision_bar_ts: i64) {
         let earliest = ((ready_ts + BAR_MS - 1) / BAR_MS) * BAR_MS;
-        // Later of the existing and the new bound: a late-processed bar can only
-        // push a fill later, never earlier.
-        if self.pending_targets.is_some() {
+        // Adjust only decisions first made at this close. Moving old bounds on
+        // every later report postpones them forever in ordinary live operation.
+        if self.pending_targets.is_some() && self.pending_decided_at == Some(decision_bar_ts) {
             self.pending_not_before = self.pending_not_before.max(earliest);
         }
-        if self.flatten_next {
+        if self.flatten_next && self.flatten_decided_at == Some(decision_bar_ts) {
             self.flatten_not_before = self.flatten_not_before.max(earliest);
         }
         for pos in &mut self.positions {
-            if pos.next_action.is_some() {
+            if pos.next_action.is_some() && pos.action_decided_at == Some(decision_bar_ts) {
                 pos.action_not_before = pos.action_not_before.max(earliest);
             }
         }
@@ -1355,6 +1447,7 @@ impl XsPortfolio {
                 self.equity,
                 self.start_equity,
                 self.peak,
+                self.risk_peak,
                 self.max_dd,
                 self.cost_mult,
                 self.reserved
@@ -1362,6 +1455,8 @@ impl XsPortfolio {
             .iter()
             .all(|v| v.is_finite())
                 && self.reserved >= 0.0
+                && self.risk_peak >= 0.0
+                && self.resume_not_before.is_none_or(|at| at >= 0)
                 && self.start_equity > 0.0
                 && self.cost_mult > 0.0,
             "invalid persisted account values"
@@ -1491,6 +1586,8 @@ pub struct DayRow {
     /// Positions closed that day and how many made money.
     pub trades: usize,
     pub wins: usize,
+    /// Drawdown exits/cooldown are still pending at this day's close.
+    pub stopped_out: bool,
 }
 
 /// Step `pf` over `range` with `p`, appending one row per UTC day (equity marked
@@ -1532,6 +1629,7 @@ pub fn run_daily(
                 },
                 trades: closed.len(),
                 wins: closed.iter().filter(|x| x.pnl > 0.0).count(),
+                stopped_out: pf.stopped_out,
             });
             prev = equity;
             seen = pf.trades.len();
@@ -1578,6 +1676,132 @@ mod tests {
 
     fn sc(m: &Market) -> Vec<Vec<Option<Score>>> {
         crate::engine::scores::compute(m, 100)
+    }
+
+    #[test]
+    fn long_only_accepts_one_legal_coarse_lot_without_neutral_constraints() {
+        let mut m = market(&[vec![100.0; 200]]);
+        let rules = m.rules[0].as_mut().unwrap();
+        rules.qty_step = 0.01;
+        rules.min_qty = 0.01;
+        let scores = sc(&m);
+        assert!(scores[0][150].is_some(), "one-symbol percentile is neutral");
+        let p = XsParams {
+            long_only: true,
+            signal: Signal::Return,
+            lookback: 1,
+            top: 1,
+            ..risk_params(Risk::default())
+        };
+        let (targets, top, _) = funded_targets(&m, &scores, 150, &p, 10.0, 1.0);
+        assert_eq!(top, 1);
+        assert_eq!(targets.get(&0), Some(&Side::Long));
+        let neutral = XsParams {
+            long_only: false,
+            ..p
+        };
+        assert!(funded_targets(&m, &scores, 150, &neutral, 10.0, 1.0)
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn live_high_water_mark_survives_until_later_drawdown() {
+        let m = flat_with(&[]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 400.0, &p);
+        let high = std::collections::HashMap::from([("AUSDT".into(), 200.0)]);
+        assert!(pf.live_check(&high, 101 * BAR_MS + 1).is_empty());
+        let (peak, _, _) = pf.risk_watermarks();
+        assert!(peak > 1700.0);
+        let mut restored: XsPortfolio =
+            serde_json::from_value(serde_json::to_value(&pf).unwrap()).unwrap();
+        let low = std::collections::HashMap::from([("AUSDT".into(), 100.0)]);
+        restored.live_check(&low, 101 * BAR_MS + 2);
+        assert!(restored.stopped_out);
+        assert!(restored.metrics().max_drawdown_pct > 25.0);
+    }
+
+    #[test]
+    fn live_portfolio_drawdown_waits_for_every_legs_fresh_price() {
+        let m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        let p = risk_params(Risk::default());
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 100, 0, Side::Long, 200.0, &p);
+        pf.open(&m, 100, 1, Side::Long, 200.0, &p);
+        let mut marks = std::collections::HashMap::from([("S0USDT".into(), 20.0)]);
+        let before = pf.risk_watermarks();
+        pf.live_check(&marks, 101 * BAR_MS + 1);
+        assert!(!pf.stopped_out);
+        assert_eq!(pf.risk_watermarks(), before);
+        assert!(pf.positions.iter().all(|p| p.live_exit.is_none()));
+        marks.insert("S1USDT".into(), 100.0);
+        pf.live_check(&marks, 101 * BAR_MS + 2);
+        assert!(pf.stopped_out);
+        assert!(pf.positions.iter().all(|p| p.live_exit.is_some()));
+    }
+
+    #[test]
+    fn cooldown_rearm_retains_balance_gate_and_second_cycle_stop() {
+        let mut m = market(&[vec![100.0; 200], vec![100.0; 200]]);
+        for rows in [&mut m.bars, &mut m.marks] {
+            for row in rows {
+                for (t, bar) in row.iter_mut().enumerate().skip(151) {
+                    let price = if t >= 157 { 36.0 } else { 60.0 };
+                    *bar = Some(crate::engine::Bar {
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: 1.0,
+                        turnover: 100.0,
+                    });
+                }
+            }
+        }
+        let p = XsParams {
+            long_only: true,
+            hold: 192,
+            signal: Signal::Return,
+            lookback: 1,
+            ..risk_params(Risk::default())
+        };
+        let scores = sc(&m);
+        let mut pf = XsPortfolio::new(1000.0);
+        pf.open(&m, 150, 0, Side::Long, 400.0, &p);
+        pf.step(&m, &scores, 151, &p);
+        assert!(pf.stopped_out);
+        pf.entries_allowed = false;
+        for t in 152..=153 {
+            pf.step(&m, &scores, t, &p);
+        }
+        assert!(
+            pf.stopped_out && pf.positions.is_empty(),
+            "invalid settings block resume"
+        );
+        pf.entries_allowed = true;
+        pf.reserved = pf.equity - 4.0;
+        pf.decide_close(&m, &scores, 153, &p);
+        assert!(pf.stopped_out, "less than 5 free remains blocked");
+        pf.reserved = 0.0;
+        pf.decide_close(&m, &scores, 153, &p);
+        assert!(!pf.stopped_out);
+        let global_dd = pf.metrics().max_drawdown_pct;
+        assert!(global_dd > 25.0);
+        pf.step(&m, &scores, 154, &p);
+        assert!(pf.positions.is_empty(), "normal decision latency remains");
+        pf.step(&m, &scores, 155, &p);
+        assert_eq!(pf.positions.len(), 1);
+        assert!(
+            pf.metrics().max_drawdown_pct >= global_dd,
+            "new entry costs also count"
+        );
+        assert_eq!(pf.peak, 1000.0, "global peak is never reset on resume");
+        pf.step(&m, &scores, 156, &p);
+        pf.step(&m, &scores, 157, &p);
+        assert!(pf.stopped_out, "a new 25% cycle drawdown must exit again");
+        assert!(pf.metrics().max_drawdown_pct > global_dd);
     }
 
     #[test]
@@ -1706,7 +1930,8 @@ mod tests {
         pf.install_entry_gate(true);
         assert!(pf.allocation_note.starts_with("settings changed"));
         pending_pair(&mut pf, &p);
-        pf.defer_new_decisions(101 * BAR_MS + 1);
+        pf.pending_decided_at = Some(100 * BAR_MS);
+        pf.defer_new_decisions(101 * BAR_MS + 1, 100 * BAR_MS);
         pf.step(&m, &vec![vec![None; 200]; 2], 101, &p);
         assert!(pf.positions.is_empty());
         pf.step(&m, &vec![vec![None; 200]; 2], 102, &p);

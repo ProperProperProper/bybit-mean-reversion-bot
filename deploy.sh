@@ -14,11 +14,18 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SIGN_ID="bot-06c819130362ed6a"
 
 cd "$REPO"
+# NOTE(agents): EVERY change needs exact-file review: Claude first, Codex when
+# Claude is unavailable (user override). Never count oMLX or automatic approval.
+REVIEW_GATE="$HOME/Documents/Codex/bybit-agent-mcp/review_gate.py"
+check_review() { python3 "$REVIEW_GATE" --check; }
+check_review
 cargo build --release --bin bot
 cargo test --release --all-targets
 cargo clippy --all-targets -- -D warnings
 python3 -m unittest discover -s tests -p 'test_*.py'
 cargo build --release --example fetch_research_data
+
+check_review
 
 # NOTE(agents): EVERY deployment starts from fresh data. Stop and verify both
 # launchd and its process before deleting anything; denied control must fail.
@@ -53,6 +60,7 @@ RESET_PY
 # Failure leaves the service stopped instead of showing an old/invalid chart.
 target/release/examples/fetch_research_data
 
+check_review
 mkdir -p "$RUNTIME/bin" "$RUNTIME/logs"
 install -m 0755 target/release/bot "$RUNTIME/bin/bot.new"
 # Ad-hoc sign with a stable identifier: the linker's default embeds a build
@@ -82,6 +90,7 @@ cat > "$PLIST" <<PLIST_EOF
 PLIST_EOF
 plutil -lint "$PLIST" >/dev/null
 
+check_review
 started=false
 for i in 1 2 3 4 5; do
     if launchctl bootstrap "gui/$(id -u)" "$PLIST"; then started=true; break; fi

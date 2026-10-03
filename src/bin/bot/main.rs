@@ -41,21 +41,26 @@ async fn backtest() -> Result<()> {
     eprintln!("real account free balance {balance:.2} USDT; measuring Bybit rules (fees, margin tiers, order books)...");
     cache.put_rules(&client.fetch_rules(&creds, &candidates).await?)?;
     let lots = data::universe(&candidates, &cache.rules_symbols()?, walkforward::UNIVERSE);
-    let symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
+    let symbols: Vec<String> = lots.into_iter().map(|i| i.symbol).collect();
     cache.put_universe(&symbols)?;
     eprintln!(
         "{} USDT perpetuals; syncing closed 15m bars + funding...",
         symbols.len()
     );
     let t0 = Instant::now();
-    let last = data::sync(&client, &cache, &symbols, |i, n| {
+    let outcome = data::sync(&client, &cache, &symbols, |i, n| {
         if i % 50 == 0 || i == n {
             eprintln!("  synced {i}/{n}");
         }
     })
     .await?;
     eprintln!("sync done in {:.0}s", t0.elapsed().as_secs_f64());
-    let market = cache.market(&symbols, last)?;
+    anyhow::ensure!(
+        outcome.failed_symbols.is_empty(),
+        "backtest data sync failed for {}; refusing stale funding",
+        outcome.failed_symbols.join(",")
+    );
+    let market = cache.market(&symbols, outcome.last_closed)?;
     let t1 = Instant::now();
     let report = tokio::task::spawn_blocking(move || {
         let sc = scores::compute(&market, walkforward::UNIVERSE);

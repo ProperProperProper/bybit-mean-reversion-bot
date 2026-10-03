@@ -1,6 +1,6 @@
 //! Long-only paper-trading service — never places orders.
 //!
-//! bar_task (each 15m close): sync closed bars + funding for the universe
+//! bar_task (each 15m close): sync closed bars and due funding for the universe
 //! (top 20 USDT perpetuals by 24h turnover with complete rules) -> scores ->
 //! step the persisted paper portfolio through every new bar with the settings
 //! from the latest search (missed bars replayed in order) -> publish the
@@ -87,6 +87,8 @@ pub struct Status {
     /// Mark-to-market of open positions at the last close (before exit fees).
     pub paper_open: f64,
     pub paper_max_drawdown_pct: f64,
+    /// Cooldown expiry; finished exits and valid entry gates are also required.
+    pub resume_not_before: Option<i64>,
     pub effective_pairs: usize,
     pub allocation_note: String,
     /// The real Bybit account's USDT wallet balance (read every bar, read-only).
@@ -267,7 +269,9 @@ fn advance_paper(
     }
     candidate.params = Some(next.clone());
     candidate.portfolio.decide_close(market, sc, t, next);
-    candidate.portfolio.defer_new_decisions(ready_ts);
+    candidate
+        .portfolio
+        .defer_new_decisions(ready_ts, market.ts[t]);
     *ps = candidate;
     Ok(())
 }
@@ -470,11 +474,15 @@ fn forward_test_daily(dir: &Path, start: f64) -> Result<serde_json::Value> {
         "trades": m.trades, "wins": m.wins, "profit_factor": m.profit_factor(), "liquidations": m.liquidations,
         "fees": pf.trades.iter().map(|t| t.fees).sum::<f64>(), "funding": pf.trades.iter().map(|t| t.funding).sum::<f64>(),
         "segments": segments, "days": days,
+        "stopped_out": pf.stopped_out,
+        "drawdown_exits": pf.trades.iter().filter(|t| t.reason.starts_with("Drawdown stop")).count(),
         "test_kind": "historical_simulation",
         "assumptions": [
             "Uses the paper engine; no exchange orders or actual fills.",
             "Today's eligible universe, fees, risk tiers and order books are applied to historical candles.",
-            "Historical report latency, intrabar price order and funding-history completeness are not verified."
+            "Historical report latency, intrabar price order and funding-history completeness are not verified.",
+            "Mark-triggered intrabar exits use the trigger mark plus measured book cost as a fill approximation; contemporaneous executable prices are unavailable.",
+            "25% drawdown exits use a per-cycle peak; after a 15-minute cooldown and completed exits, valid entries are re-evaluated without waiting for the holding period. Maximum drawdown remains measured from the global peak."
         ],
     }))
 }
@@ -499,7 +507,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         //               fetching or scoring; its stored rows are deleted, and a held one stops the
         //               bar for explicit recovery (see below).
         let trading: std::collections::HashSet<String> =
-            lots.iter().map(|(s, _, _)| s.clone()).collect();
+            lots.iter().map(|i| i.symbol.clone()).collect();
         let candidates = app
             .client
             .top_margin_tokens(&lots, walkforward::CANDIDATES)
@@ -558,7 +566,7 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                 ),
             );
         }
-        let mut symbols: Vec<String> = lots.into_iter().map(|(s, _, _)| s).collect();
+        let mut symbols: Vec<String> = lots.into_iter().map(|i| i.symbol).collect();
         app.cache.put_universe(&symbols)?;
         // NOTE(agents): Strict exclusion includes stale held symbols. Purge their cached data
         // before any fetch; an excluded holding requires explicit recovery, never a fabricated exit.
@@ -581,7 +589,8 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         }
         symbols.sort();
         let hb2 = hb.clone();
-        let last = data::sync(&app.client, &app.cache, &symbols, move |_, _| hb2.beat()).await?;
+        let sync = data::sync(&app.client, &app.cache, &symbols, move |_, _| hb2.beat()).await?;
+        let last = sync.last_closed;
         if last < closed {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
@@ -594,6 +603,12 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         // exchange gap) sits out; a held one must be complete or the bar fails.
         let incomplete: Vec<(String, String)> = (0..market.symbols.len())
             .filter_map(|s| {
+                if sync.failed_symbols.contains(&market.symbols[s]) {
+                    return Some((
+                        market.symbols[s].clone(),
+                        "market or funding fetch failed".into(),
+                    ));
+                }
                 let e = market.validate_symbol(s).err()?;
                 Some((market.symbols[s].clone(), format!("{e:#}")))
             })
@@ -821,6 +836,11 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
             s.paper_realized = m.end_equity - m.start_equity;
             s.paper_open = m.open_unrealized;
             s.paper_max_drawdown_pct = m.max_drawdown_pct;
+            s.resume_not_before = if ps.portfolio.stopped_out {
+                ps.portfolio.resume_not_before
+            } else {
+                None
+            };
             if ps.portfolio.entries_allowed {
                 s.effective_pairs = ps.portfolio.effective_top;
                 s.allocation_note = ps.portfolio.allocation_note.clone();
@@ -834,10 +854,10 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         let stopped = paper.as_ref().is_some_and(|ps| ps.portfolio.stopped_out);
         s.mode = match choice {
             _ if stopped && s.paper_open_positions > 0 => {
-                "STOPPED OUT (25% drawdown, closing positions)"
+                "DRAWDOWN EXIT (25%, closing positions before resuming)"
             }
             _ if stopped => {
-                "STOPPED OUT (25% drawdown, no new positions until the next fresh reset)"
+                "COOLDOWN (25% drawdown exit; re-evaluate after 15 minutes when entry gates pass)"
             }
             None => "SEARCHING (first search running)",
             Some(walkforward::Choice::NewBest) => "TRADING (new best settings)",
@@ -933,8 +953,9 @@ async fn price_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                 let lines = {
                     let mut guard = app.paper.write().unwrap_or_else(|e| e.into_inner());
                     let Some(ps) = guard.as_mut() else { continue };
+                    let before = ps.portfolio.risk_watermarks();
                     let lines = ps.portfolio.live_check(&fresh, chrono::Utc::now().timestamp_millis());
-                    if !lines.is_empty() {
+                    if !lines.is_empty() || ps.portfolio.risk_watermarks() != before {
                         persist_paper(&app.dir.join(PAPER_FILE), ps)?;
                     }
                     lines
@@ -1018,6 +1039,7 @@ async fn search_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         })
         .await?;
         hb.beat();
+        let finished = Instant::now();
         let pause = match result {
             Ok((report, chosen, choice)) => {
                 app.event(
@@ -1066,10 +1088,13 @@ async fn search_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                 SEARCH_RETRY
             }
         };
-        let until = Instant::now() + pause;
+        let until = finished + pause;
         while Instant::now() < until {
             hb.beat();
-            tokio::time::sleep(Duration::from_secs(30).min(until - Instant::now())).await;
+            tokio::time::sleep(
+                Duration::from_secs(30).min(until.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
     }
 }
@@ -1164,7 +1189,7 @@ document.getElementById('strat').textContent=s.strategy+' — last update '+t(s.
 const sg=x=>(x>=0?'+':'')+f(x), pc=x=>sg(x)+'%', st=s.paper_start_equity||1;
 const pu=p=>(p.side==="Long"?1:-1)*(p.mark-p.entry)*p.qty-p.fees-p.funding;
 const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(Bybit, read-only, '+f(s.account_reserved)+' committed elsewhere, '+t(s.account_balance_ts)+')</span>'],['Paper equity',f(s.paper_equity)+' USDT <span class=k>('+pc((s.paper_equity/st-1)*100)+' from '+f(st,0)+')</span>'],['Realised P&L <span class=k title="closed trades + fees and funding already paid">ⓘ</span>','<span class='+(s.paper_realized>=0?'ok':'bad')+'>'+sg(s.paper_realized)+' USDT ('+pc(s.paper_realized/st*100)+')</span>'],['Open P&L <span class=k title="open positions marked at the last close">ⓘ</span>','<span class='+(s.paper_open>=0?'ok':'bad')+'>'+sg(s.paper_open)+' USDT ('+pc(s.paper_open/st*100)+')</span>'],['Open positions',s.paper_open_positions],['Dynamic allocation',s.effective_pairs+' pairs <span class=k>'+s.allocation_note+'</span>'],
-['Closed trades / wins',s.paper_trades+' / '+s.paper_wins],['Max drawdown',f(s.paper_max_drawdown_pct,1)+'%'],
+['Closed trades / wins',s.paper_trades+' / '+s.paper_wins],['Drawdown recovery',s.resume_not_before?'cooldown until '+t(s.resume_not_before)+'; exits must finish and entry gates must pass':'ready; 25% exit remains active'],['Max drawdown',f(s.paper_max_drawdown_pct,1)+'%'],
 ['Paper settings',s.report?'<span class='+((s.mode||'').startsWith('TRADING')?'ok':'bad')+'>'+s.mode+'</span>':'…'],
 ['Live price monitor',s.live_symbols?s.live_symbols+' held symbols on Bybit WebSocket (mark price), last update '+t(s.live_last_ms):'idle (no positions held)'],['Parameter search',s.search_finished_ms?'last finished '+t(s.search_finished_ms)+', next about '+t(s.search_finished_ms+3600000):'first search running'],['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
 ['Tasks',Object.entries(s.tasks||{}).map(([k,v])=>k+(v.running?' ✓':' ✗')).join(' ')]];
@@ -1206,6 +1231,7 @@ const assumptions=document.createElement('div');
 assumptions.className='k';
 assumptions.textContent=(r.assumptions||[]).join(' ');
 document.getElementById('fsum').appendChild(assumptions);
+if(r.drawdown_exits||r.stopped_out){const notice=document.createElement('p');notice.className='warn';notice.textContent='25% drawdown exits stay active. After exits finish and a 15-minute cooldown, entries are re-evaluated with the usual causal fill delay when settings, data and free balance allow. Maximum drawdown still measures the whole simulation; exit costs can push losses beyond 25%.';document.getElementById('fsum').appendChild(notice);}
 const W=960,H=320,L=60,R=10,T=10,eqH=170,gap=20,bH=H-T-eqH-gap-24,n=days.length,bw=(W-L-R)/n;
 const eqs=[r.start_equity,...days.map(d=>d.equity)],lo=Math.min(...eqs),hi=Math.max(...eqs);
 const ey=v=>T+eqH-(v-lo)/(hi-lo||1)*eqH, mx=Math.max(...days.map(d=>Math.abs(d.pnl)))||1, by0=T+eqH+gap+bH/2, by=v=>by0-v/mx*bH/2;
@@ -1221,7 +1247,7 @@ days.forEach((d,i)=>{const x=L+i*bw+bw*0.15,y=Math.min(by(d.pnl),by0),h=Math.abs
 const sw=r.segments.length>1?days.findIndex(d=>d.day_ts>=r.segments[1].traded[0]-86400000):-1;
 if(sw>0) g+=`<line x1=${L+sw*bw+bw/2} x2=${L+sw*bw+bw/2} y1=${T} y2=${H-20} stroke=#b26a00 stroke-dasharray=3 /><text x=${L+sw*bw+bw/2+4} y=${T+24} fill=#b26a00>settings re-chosen</text>`;
 document.getElementById('fchart').innerHTML=g+`<text x=${L} y=${by0-bH/2-4} fill=#666>daily equity change USDT (includes unrealised P&amp;L)</text></svg>`;
-document.getElementById('fdays').innerHTML='<tr><th>Day (UTC)<th>Equity change USDT<th>Equity change %<th>End-of-day equity<th>Trades closed<th>Closed wins</tr>'+days.map(d=>`<tr><td>${new Date(d.day_ts).toISOString().slice(0,10)}<td class=${d.pnl>=0?'ok':'bad'}>${S(d.pnl)}<td class=${d.pnl>=0?'ok':'bad'}>${P(d.pnl_pct)}<td>${F(d.equity)}<td>${d.trades}<td>${d.wins}</tr>`).join('');
+document.getElementById('fdays').innerHTML='<tr><th>Day (UTC)<th>Equity change USDT<th>Equity change %<th>End-of-day equity<th>Trades closed<th>Closed wins<th>Trading state</tr>'+days.map(d=>`<tr><td>${new Date(d.day_ts).toISOString().slice(0,10)}<td class=${d.pnl>=0?'ok':'bad'}>${S(d.pnl)}<td class=${d.pnl>=0?'ok':'bad'}>${P(d.pnl_pct)}<td>${F(d.equity)}<td>${d.trades}<td>${d.wins}<td>${d.stopped_out?'Drawdown exit / cooldown':'Entries enabled when gates pass'}</tr>`).join('');
 }catch(e){document.getElementById('fsum').textContent='chart error: '+e}}
 research();
 // NOTE(agents): Reload on process restart: the page embeds strategy labels and
@@ -1234,8 +1260,236 @@ tick();guard();setInterval(tick,5000);setInterval(guard,15000);
 #[cfg(test)]
 mod causal_tests {
     use super::*;
+
     #[test]
-    fn new_report_does_not_change_replayed_bars() {
+    fn candle_service_drawdown_exit_is_observed_resumed_within_an_hour() {
+        let mut full = fixture_market();
+        for rows in [&mut full.bars, &mut full.marks] {
+            for row in rows {
+                let price = row[193].unwrap().close * 0.7;
+                for bar in row.iter_mut().skip(194).flatten() {
+                    bar.open = price;
+                    bar.high = price;
+                    bar.low = price;
+                    bar.close = price;
+                }
+            }
+        }
+        let p = XsParams {
+            signal: xs::Signal::Return,
+            flip: false,
+            lookback: 1,
+            hold: 192,
+            top: 1,
+            gross_leverage: 2.0,
+            stop_pct: None,
+            risk: xs::Risk::default(),
+            long_only: true,
+            regime: xs::Regime::Off,
+        };
+        let mut ps = PaperState {
+            schema_version: 2,
+            settlements_seen: Default::default(),
+            portfolio: XsPortfolio::new(1000.0),
+            last_ts: 189 * BAR_MS,
+            params: None,
+            last_account_balance: None,
+        };
+        let mut resumed_observed_at = None;
+        for t in 190..=199 {
+            let mut market = full.clone();
+            market.ts.truncate(t + 1);
+            for row in &mut market.bars {
+                row.truncate(t + 1);
+            }
+            for row in &mut market.marks {
+                row.truncate(t + 1);
+            }
+            let sc = scores::compute(&market, 20);
+            advance_paper(
+                &mut ps,
+                &market,
+                &sc,
+                &p,
+                true,
+                market.ts[t] + BAR_MS + 5000,
+                None,
+            )
+            .unwrap();
+            if !ps.portfolio.trades.is_empty()
+                && !ps.portfolio.positions.is_empty()
+                && resumed_observed_at.is_none()
+            {
+                resumed_observed_at = Some(market.ts[t] + BAR_MS + 5000);
+            }
+            if t == 194 {
+                assert!(ps.portfolio.stopped_out);
+            }
+            if t == 195 {
+                assert!(
+                    ps.portfolio.stopped_out && ps.portfolio.positions.len() == 1,
+                    "finish the delayed exit before rearming"
+                );
+            }
+            if t == 196 {
+                assert!(ps.portfolio.positions.is_empty());
+                assert!(!ps.portfolio.stopped_out);
+                assert_eq!(ps.portfolio.trades[0].reason, "Drawdown stop");
+            }
+        }
+        assert_eq!(ps.portfolio.positions.len(), 1);
+        let entry = ps.portfolio.positions[0].entry_ts;
+        assert!(
+            entry - 195 * BAR_MS < 60 * 60_000,
+            "entry timestamp {entry} must follow stop decision within the hour"
+        );
+        assert_eq!(entry, 198 * BAR_MS, "resume bypasses the 48-hour hold");
+        assert!(
+            resumed_observed_at.unwrap() - (195 * BAR_MS + 5000) <= 60 * 60_000,
+            "paper observation timing, not just simulated entry time, must meet the hour"
+        );
+        assert!(
+            ps.portfolio.metrics().max_drawdown_pct > 25.0,
+            "resuming must not erase global historical drawdown"
+        );
+    }
+
+    #[test]
+    fn websocket_drawdown_exit_service_replay_resumes_within_an_hour() {
+        let mut full = fixture_market();
+        for rows in [&mut full.bars, &mut full.marks] {
+            for row in rows {
+                let price = row[193].unwrap().close * 0.7;
+                for bar in row.iter_mut().skip(194).flatten() {
+                    bar.open = price;
+                    bar.high = price;
+                    bar.low = price;
+                    bar.close = price;
+                }
+            }
+        }
+        let p = XsParams {
+            signal: xs::Signal::Return,
+            flip: false,
+            lookback: 1,
+            hold: 192,
+            top: 1,
+            gross_leverage: 2.0,
+            stop_pct: None,
+            risk: xs::Risk::default(),
+            long_only: true,
+            regime: xs::Regime::Off,
+        };
+        let mut ps = PaperState {
+            schema_version: 2,
+            settlements_seen: Default::default(),
+            portfolio: XsPortfolio::new(1000.0),
+            last_ts: 189 * BAR_MS,
+            params: None,
+            last_account_balance: None,
+        };
+        let advance = |ps: &mut PaperState, t: usize| {
+            let mut market = full.clone();
+            market.ts.truncate(t + 1);
+            for row in &mut market.bars {
+                row.truncate(t + 1);
+            }
+            for row in &mut market.marks {
+                row.truncate(t + 1);
+            }
+            let sc = scores::compute(&market, 20);
+            advance_paper(
+                ps,
+                &market,
+                &sc,
+                &p,
+                true,
+                market.ts[t] + BAR_MS + 5000,
+                None,
+            )
+            .unwrap();
+        };
+        for t in 190..=193 {
+            advance(&mut ps, t);
+        }
+        assert_eq!(ps.portfolio.positions.len(), 1);
+        let held = &ps.portfolio.positions[0];
+        let marks = std::collections::HashMap::from([(
+            held.symbol.clone(),
+            full.marks[held.sym][194].unwrap().close,
+        )]);
+        let trigger = 194 * BAR_MS + 60_000;
+        ps.portfolio.live_check(&marks, trigger);
+        assert!(ps.portfolio.stopped_out);
+        advance(&mut ps, 194);
+        assert!(
+            ps.portfolio.positions.is_empty() && ps.portfolio.stopped_out,
+            "cooldown remains"
+        );
+        assert_eq!(ps.portfolio.trades[0].exit_ts, trigger);
+        for t in 195..=197 {
+            advance(&mut ps, t);
+        }
+        assert_eq!(ps.portfolio.positions.len(), 1);
+        assert_eq!(ps.portfolio.positions[0].entry_ts, 197 * BAR_MS);
+        assert!(
+            198 * BAR_MS + 5000 - trigger <= 60 * 60_000,
+            "fresh-report observation of the new position meets the hour"
+        );
+        assert!(ps.portfolio.metrics().max_drawdown_pct > 25.0);
+    }
+
+    #[test]
+    fn on_time_live_reports_do_not_postpone_an_older_entry_forever() {
+        let full = fixture_market();
+        let p = XsParams {
+            signal: xs::Signal::Return,
+            flip: false,
+            lookback: 1,
+            hold: 16,
+            top: 1,
+            gross_leverage: 1.0,
+            stop_pct: None,
+            risk: xs::Risk::default(),
+            long_only: true,
+            regime: xs::Regime::Off,
+        };
+        let mut ps = PaperState {
+            schema_version: 2,
+            settlements_seen: Default::default(),
+            portfolio: XsPortfolio::new(1000.0),
+            last_ts: 157 * BAR_MS,
+            params: None,
+            last_account_balance: None,
+        };
+        for t in 158..=162 {
+            let mut market = full.clone();
+            market.ts.truncate(t + 1);
+            for row in &mut market.bars {
+                row.truncate(t + 1);
+            }
+            for row in &mut market.marks {
+                row.truncate(t + 1);
+            }
+            let sc = scores::compute(&market, 20);
+            advance_paper(
+                &mut ps,
+                &market,
+                &sc,
+                &p,
+                true,
+                market.ts[t] + BAR_MS + 5000,
+                None,
+            )
+            .unwrap();
+            if t <= 160 {
+                assert!(ps.portfolio.positions.is_empty());
+            }
+        }
+        assert_eq!(ps.portfolio.positions.len(), 1);
+        assert_eq!(ps.portfolio.positions[0].entry_ts, 161 * BAR_MS);
+    }
+    fn fixture_market() -> bybit_mean_reversion_bot::engine::Market {
         let mut market = bybit_mean_reversion_bot::engine::Market {
             marks: Vec::new(),
             listing_times: Vec::new(),
@@ -1281,6 +1535,12 @@ mod causal_tests {
             funding: vec![vec![]; 2],
         };
         market.marks = market.bars.clone();
+        market
+    }
+
+    #[test]
+    fn new_report_does_not_change_replayed_bars() {
+        let market = fixture_market();
         let sc = scores::compute(&market, 100);
         let old = XsParams {
             signal: xs::Signal::Return,
@@ -1311,7 +1571,7 @@ mod causal_tests {
         }
         expected.install_entry_gate(true);
         expected.decide_close(&market, &sc, 199, &next);
-        expected.defer_new_decisions(market.ts[199] + BAR_MS);
+        expected.defer_new_decisions(market.ts[199] + BAR_MS, market.ts[199]);
         advance_paper(
             &mut ps,
             &market,

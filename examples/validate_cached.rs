@@ -98,9 +98,7 @@ fn main() -> Result<()> {
     let mut forwards = Vec::new();
     for (k, report) in reports.iter().enumerate().take(2) {
         let Some(p) = &report.params else {
-            forwards.push(
-                json!({"from_window":k+1,"to_window":k+2,"error":"no usable settings"}),
-            );
+            forwards.push(json!({"from_window":k+1,"to_window":k+2,"error":"no usable settings"}));
             continue;
         };
         let range = (k + 1) * BARS..(k + 2) * BARS;

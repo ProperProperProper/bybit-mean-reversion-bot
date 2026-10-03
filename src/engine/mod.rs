@@ -10,14 +10,14 @@
 //! * `xs` — the strategy: cross-sectional ranking, market-neutral or long only
 //!   (live: long-only, settings from `walkforward::search_full` over every parameter), with an
 //!   optional BTC trend filter and drawdown rules.
-//! * `walkforward` — the 14-day walk-forward gate and the strategy grids.
+//! * `walkforward` — the full 14-day parameter search and the strategy grids.
 //! * `metrics` — trade records and performance metrics.
 //! * `research` — the three fixed 14-day research windows and research start equity.
 //! * `governor`, `supervisor`, `keychain` — CPU cap, task restarts, credentials.
 //!
 //! Decisions are made at a bar's close and filled at the next open (or at a
 //! level inside a later bar, adverse first): no lookahead, no repainting; the
-//! same engine drives backtest, walk-forward and paper trading.
+//! same engine drives backtests, the parameter search and paper trading.
 
 pub mod data;
 pub mod governor;

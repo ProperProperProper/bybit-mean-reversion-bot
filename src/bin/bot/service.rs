@@ -1,11 +1,12 @@
-//! Paper-trading service for the long-only "calm dip" strategy (see
-//! walkforward::live_combo, every parameter) — never places orders.
+//! Long-only paper-trading service — never places orders.
 //!
 //! bar_task (each 15m close): sync closed bars + funding for the universe
 //! (top 20 USDT perpetuals by 24h turnover with complete rules) -> scores ->
-//! 14-day walk-forward -> step the persisted paper portfolio through every new
-//! bar with the chosen params (missed bars replayed in order) -> publish the
-//! current LONG targets (calmest coins that fell most over 24h).
+//! step the persisted paper portfolio through every new bar with the settings
+//! from the latest search (missed bars replayed in order) -> publish the
+//! current LONG targets.
+//! search_task: every parameter (walkforward::live_combo) over one 14-day
+//! window, champion/challenger; next search 60 min after the last finished.
 //! Console: 127.0.0.1:8787 (`/`, `/api/status`, `/api/signals`, `/api/research`),
 //! polled by the page (no WebSocket).
 
@@ -40,8 +41,8 @@ const PAPER_FILE: &str = "paper_xs.json";
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalRow {
     pub symbol: String,
-    /// Ranking value of the live signal (CalmDip: mean of the volatility and
-    /// 24h-return percentiles; lowest is bought).
+    /// Ranking value of the signal in use (negated when the settings buy the
+    /// highest values, so the lowest is always bought first).
     pub signal: f64,
     /// 1 = lowest value (long side).
     pub rank: usize,
@@ -285,7 +286,7 @@ struct App {
     search: RwLock<Option<Search>>,
 }
 
-/// One completed parameter search (walk-forward + champion/challenger).
+/// One completed parameter search (full 14-day window + champion/challenger).
 #[derive(Clone)]
 struct Search {
     report: SearchReport,
@@ -320,7 +321,7 @@ impl App {
 }
 
 pub async fn serve(dir: PathBuf) -> Result<()> {
-    info!("Bybit Mean Reversion Bot — long-only calm dip (paper + signals only): 15m bars, top {} USDT perps, 14-day walk-forward, CPU target {}%",
+    info!("Bybit Mean Reversion Bot — long only (paper + signals only): 15m bars, top {} USDT perps, full 14-day search over every parameter, CPU target {}%",
         walkforward::UNIVERSE, governor::CPU_TARGET_PCT);
     governor::global();
     let paper = load_paper(&dir.join(PAPER_FILE))?;
@@ -343,7 +344,7 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
         dir,
         health: health.clone(),
         status: RwLock::new(Status {
-            strategy: "Long only, calm dip: buy the calmest coins that fell most over 24h, optional BTC trend filter (paper only)".into(),
+            strategy: "Long only: signal and settings chosen by a search over every parameter on one 14-day window, two safety rules (paper only)".into(),
             started_ms: chrono::Utc::now().timestamp_millis(),
             universe: walkforward::UNIVERSE,
             ..Default::default()
@@ -405,7 +406,7 @@ pub async fn serve(dir: PathBuf) -> Result<()> {
 }
 
 /// One 14-day forward test, day by day (14 days is the test limit): the live
-/// walk-forward picks settings on the 14 days Sep 3 -> Sep 17 2026, then they
+/// full-window search picks settings on the 14 days Sep 3 -> Sep 17 2026, then they
 /// trade the next 14 days, Sep 17 -> Oct 1, which they never saw, from
 /// the real account balance. The earlier window only supplies the screener's look-back
 /// at the start, as the live bot has it. Real cached Bybit bars + funding only
@@ -601,11 +602,11 @@ async fn bar_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
         }
         let market = Arc::new(market);
         hb.beat();
-        // NOTE(agents): Size the walk-forward from the FREE balance (minus margin committed
-        //               elsewhere), like the live sizing, so the search and safety rules judge the account that would
-        //               really trade.
-        // The walk-forward sizes from the money actually in play: the paper
-        // account's equity (which follows the real balance), else the real balance.
+        // NOTE(agents): Size the search from the FREE balance (minus margin committed elsewhere),
+        //               like the live sizing, so the search and safety rules judge the account that
+        //               would really trade.
+        // The search sizes from the money actually in play: the paper account's
+        // equity (which follows the real balance), else the real balance.
         let wf_equity = (app
             .paper
             .read()
@@ -916,8 +917,9 @@ async fn search_task(app: Arc<App>, hb: Heartbeat) -> Result<()> {
                     .is_none();
                 if unbuilt {
                     let a = app.clone();
-                    let chart = tokio::task::spawn_blocking(move || forward_test_daily(&a.dir, equity))
-                        .await?;
+                    let chart =
+                        tokio::task::spawn_blocking(move || forward_test_daily(&a.dir, equity))
+                            .await?;
                     let value = chart.unwrap_or_else(|e| {
                         warn!("forward test chart unavailable: {e:#}");
                         serde_json::json!({ "error": format!("{e:#}") })
@@ -1037,13 +1039,13 @@ const cards=[['Real account balance',f(s.account_balance)+' USDT <span class=k>(
 ['Paper settings',s.report?'<span class='+((s.mode||'').startsWith('TRADING')?'ok':'bad')+'>'+s.mode+'</span>':'…'],
 ['Parameter search',s.search_finished_ms?'last finished '+t(s.search_finished_ms)+', next about '+t(s.search_finished_ms+3600000):'first search running'],['Last 15m bar',t(s.last_bar_ts+900000)],['Pairs scanned',s.symbols+' (top '+s.universe+')'],['Bybit rules',s.rules_symbols+' coins (fees, margin tiers, order books) measured '+t(s.rules_ts)],['CPU',f(s.cpu_pct,0)+'%'],
 ['Tasks',Object.entries(s.tasks||{}).map(([k,v])=>k+(v.running?' ✓':' ✗')).join(' ')]];
-document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+' lowest calm-dip scores (calm and down over 24h), among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
+document.getElementById('sighelp').textContent='(at the next rebalance: long the '+s.effective_pairs+(s.params?' '+(s.params.flip?'highest':'lowest')+' '+s.params.signal+' values':' coins ranked first')+', among the top '+s.universe+' token USDT perps by 24h turnover; no entries below 5 USDT free balance)';
 document.getElementById('cards').innerHTML=cards.map(c=>`<div class=card><span class=k>${c[0]}</span><b>${c[1]}</b></div>`).join('');
 document.getElementById('nextreb').textContent=s.next_rebalance_ts?'next rebalance at '+t(s.next_rebalance_ts)+(s.params?' (every '+s.params.hold*15+' min)':''):'';
 document.getElementById('pos').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Mark<th>P&L USDT (after its fees + funding)<th>P&L % (margin)<th>Stop<th>Lev<th>Opened</tr>'+(s.paper_positions||[]).map(p=>{
  const u=pu(p),pl=u/p.margin*100;return `<tr><td>${p.symbol}<td class=${p.side}>${p.side}<td>${p.entry}<td>${p.mark}<td class=${u>=0?"ok":"bad"}>${sg(u)}<td class=${u>=0?"ok":"bad"}>${pc(pl)}<td>${f(p.stop,6)}<td>${f(p.leverage,1)}<td>${t(p.entry_ts)}</tr>`}).join('');
 const tg=g.filter(r=>r.target||r.held);
-document.getElementById('sig').innerHTML='<tr><th>Symbol<th>Target<th>Held<th>Calm-dip score<th>Rank (1 = bought first)<th>Close<th>24h turnover</tr>'+
+document.getElementById('sig').innerHTML='<tr><th>Symbol<th>Target<th>Held<th>Signal value (sign flipped when buying the highest)<th>Rank (1 = bought first)<th>Close<th>24h turnover</tr>'+
 tg.map(r=>`<tr><td>${r.symbol}<td class=${r.target||''}>${r.target||'-'}<td class=${r.held||''}>${r.held||'-'}<td>${f(r.signal)}<td>${r.rank}<td>${r.close}<td>${f(r.turnover_24h/1e6,1)}M</tr>`).join('');
 document.getElementById('ev').textContent=(s.events||[]).join('\n');
 document.getElementById('tr').innerHTML='<tr><th>Symbol<th>Side<th>Entry<th>Exit<th>P&L USDT<th>P&L % (margin)<th>Reason<th>Closed</tr>'+(s.paper_recent_trades||[]).map(x=>`<tr><td>${x.symbol}<td class=${x.side}>${x.side}<td>${x.entry}<td>${x.exit}<td class=${x.pnl>=0?"ok":"bad"}>${sg(x.pnl)}<td class=${x.pnl>=0?"ok":"bad"}>${pc(x.r*100)}<td>${x.reason}<td>${t(x.exit_ts)}</tr>`).join('');

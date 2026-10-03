@@ -22,7 +22,7 @@ There is one page per source file. Each page documents every function, type and 
 
 ## Current verification
 
-Audit findings, their fixes and the remaining limitations are in [audit.md](audit.md). The live strategy is long-only CalmDip; its validation results and their limits are in [validation.md](validation.md). Paper trades the best settings from a full 14-day search (every parameter) that pass the two safety rules (no liquidation, drawdown ≤ 25%).
+Audit findings, their fixes and the remaining limitations are in [audit.md](audit.md). The live strategy is long only, with the signal and settings chosen by the full parameter search; its validation results and their limits are in [validation.md](validation.md). Paper trades the best settings from a full 14-day search (every parameter) that pass the two safety rules (no liquidation, drawdown ≤ 25%).
 
 ## How it fits together
 

@@ -38,21 +38,31 @@ mod tests {
         assert_eq!(LIVE_COMBOS, 2_949_120);
         // Every index decodes to a distinct combination (checked on a dense
         // stride plus both ends); every listed value of every parameter occurs.
-        let picks: Vec<usize> = (0..LIVE_COMBOS).step_by(97).chain([LIVE_COMBOS - 1]).collect();
-        let mut keys: Vec<String> = picks.iter().map(|&i| format!("{:?}", live_combo(i))).collect();
+        let picks: Vec<usize> = (0..LIVE_COMBOS)
+            .step_by(97)
+            .chain([LIVE_COMBOS - 1])
+            .collect();
+        let mut keys: Vec<String> = picks
+            .iter()
+            .map(|&i| format!("{:?}", live_combo(i)))
+            .collect();
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), picks.len());
         let all: Vec<XsParams> = (0..LIVE_COMBOS).step_by(7).map(live_combo).collect();
         assert!(all.iter().all(|p| p.long_only));
         for (s, lb, flip) in signal_variants() {
-            assert!(all.iter().any(|p| p.signal == s && p.lookback == lb && p.flip == flip));
+            assert!(all
+                .iter()
+                .any(|p| p.signal == s && p.lookback == lb && p.flip == flip));
         }
         for h in HOLDS {
             assert!(all.iter().any(|p| p.hold == h));
         }
         assert!(all.iter().any(|p| p.risk.vol_scaled) && all.iter().any(|p| !p.risk.vol_scaled));
-        assert!(all.iter().any(|p| p.risk.add_pct.is_some() && p.risk.breaker_pct.is_some()));
+        assert!(all
+            .iter()
+            .any(|p| p.risk.add_pct.is_some() && p.risk.breaker_pct.is_some()));
     }
 
     #[test]
@@ -89,7 +99,6 @@ mod tests {
         // Nothing passes the safety rules: no settings, paper opens nothing.
         assert_eq!(pick::<&str>(None, None), (None, Choice::NoneSafe));
     }
-
 }
 
 // ---------------------------------------------------------------- grids
@@ -369,7 +378,10 @@ pub fn search_full(
 ) -> Result<SearchReport> {
     m.validate()?;
     if m.ts.len() != BARS {
-        bail!("search needs exactly {BARS} bars (14 days), got {}", m.ts.len());
+        bail!(
+            "search needs exactly {BARS} bars (14 days), got {}",
+            m.ts.len()
+        );
     }
     let started = Instant::now();
     let gov = governor::global();
@@ -416,4 +428,3 @@ pub fn choose_live(
     };
     pick(score(challenger), score(champion))
 }
-

@@ -1,4 +1,5 @@
-//! Bybit Mean Reversion Bot: long-only "calm dip" strategy on Bybit USDT perps
+//! Bybit Mean Reversion Bot: long-only strategy on Bybit USDT perps, settings from a
+//! full 14-day search over every parameter
 //! (paper + signals only; never places orders).
 //!
 //!   bot backtest     sync real data and print the live parameter search (one 14-day window)

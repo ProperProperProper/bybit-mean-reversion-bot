@@ -21,7 +21,7 @@ A cross-sectional portfolio over the top-20 token USDT perpetuals. At aligned re
 | `Rsi` | RSI(14) | Long oversold |
 | `Pulse` | `pulse_long − pulse_short` | Contrarian: long the most bearish |
 | `Funding` | Average hourly rate of the last 3 settled fundings | Carry: long negative, short positive |
-| `CalmDip` | Mean of the volatility and 24h-return percentiles | **Live:** long the calmest coins that fell most over 24h |
+| `CalmDip` | Mean of the volatility and 24h-return percentiles | Long the calmest coins that fell most over 24h (the signal with pre-registered relative evidence; the live search may choose any signal) |
 
 `flip` reverses the direction.
 
